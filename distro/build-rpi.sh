@@ -183,6 +183,15 @@ Package: linux-image-rpi-v8 linux-image-rpi-2712 linux-headers-rpi-v8 linux-head
 Pin: origin archive.raspberrypi.com
 Pin-Priority: 990
 PREF
+# 🚨 Debian 13 (trixie) verifies repository signatures with sqv, whose crypto
+# policy rejects SHA1 binding signatures since 2026-02-01. The Raspberry Pi
+# archive key's self-signature is still SHA1, so apt would reject
+# archive.raspberrypi.com as "not signed" (sqv exit 1). Re-allow SHA1 for this
+# chroot's apt — the confirmed workaround from raspberrypi/rpi-image-gen#171 —
+# until the Pi archive key is re-signed with a stronger hash. Written as a file
+# so it also covers every later apt update/install, not just this one.
+mkdir -p "$CH/etc/crypto-policies/back-ends"
+printf '[hash_algorithms]\nsha1 = "always"\n' > "$CH/etc/crypto-policies/back-ends/sequoia.config"
 in_chroot apt-get -q update 2>&1 | tail -n 3 || die "apt update (Debian + Pi archive) failed"
 
 # ── 2. the appliance package set (arm64 list) + kernels + essentials ──────
