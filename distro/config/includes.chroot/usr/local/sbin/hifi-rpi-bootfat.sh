@@ -52,8 +52,8 @@ copy_flavour() {   # <flavour-suffix> <kernel-dest> <initramfs-dest>
     cp -a "$_vmlinuz" "$FAT/$_kd"
     cp -a "$_initrd"  "$FAT/$_id"
     log "$_kd / $_id  ←  $(basename "$_vmlinuz")"
-    # DTBs + overlays ship beside this kernel's modules.
-    _dtbdir="$SQ/usr/lib/$(basename "${_vmlinuz#"$SQ"/boot/vmlinuz-}")"
+    # DTBs + overlays ship beside this kernel's modules, under
+    # /usr/lib/linux-image-<kver>/broadcom (kver = vmlinuz basename minus prefix).
     _dtbdir="$SQ/usr/lib/linux-image-$(basename "$_vmlinuz" | sed 's/^vmlinuz-//')"
     if [ -d "$_dtbdir/broadcom" ]; then
         cp -a "$_dtbdir"/broadcom/*.dtb "$FAT"/ 2>/dev/null || true

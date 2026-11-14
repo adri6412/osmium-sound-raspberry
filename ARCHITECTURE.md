@@ -4,6 +4,19 @@ Technical reference for how Osmium Sound is put together — components,
 processes, ports, update pipeline, and project layout. For a user-facing
 overview, features, and specs, see [README.md](README.md).
 
+> **Raspberry Pi fork — boot chain differs from the text below.** On the Pi 4 &
+> Pi 5 there is no GRUB and no ESP. The board boots through the **Raspberry Pi
+> firmware tryboot A/B scheme**: a GPT disk with a selector FAT (`autoboot.txt`
+> → `[all] boot_partition` = committed slot, `[tryboot] boot_partition` =
+> candidate), two per-slot boot FATs (firmware + `kernel8.img`/`kernel_2712.img`
+> + initramfs + DTBs + `config.txt`/`cmdline.txt`), two raw squashfs root slots
+> and a data partition. RAUC drives it through a `bootloader=custom` backend
+> (`hifi-rpi-boot.sh`): `rauc install` arms a one-shot tryboot of the new slot,
+> `hifi-rpi-reboot.sh --auto` issues `reboot "0 tryboot"`, and `rauc status
+> mark-good` on a healthy boot commits it (rollback is automatic if it fails).
+> Everything else in this document — the services, ports, OTA pipeline, Lyrion,
+> DSP, Qt kiosk — applies unchanged. See [FORK.md](FORK.md).
+
 ## System overview
 
 ```mermaid
