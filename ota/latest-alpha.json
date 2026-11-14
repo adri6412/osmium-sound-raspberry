@@ -1,0 +1,17 @@
+{
+  "tag_name": "2.5.26-dev.6-alpha3",
+  "name": "2.5.26-dev.6-alpha3",
+  "body": "",
+  "assets": [
+    {
+      "name": "osmium-rpi-2.5.26-dev.6-alpha3.raucb",
+      "browser_download_url": "https://github.com/adri6412/osmium-sound-raspberry/releases/download/2.5.26-dev.6-alpha3/osmium-rpi-2.5.26-dev.6-alpha3.raucb",
+      "size": 667994802
+    },
+    {
+      "name": "osmium-rpi-2.5.26-dev.6-alpha3.raucb.sha256",
+      "browser_download_url": "https://github.com/adri6412/osmium-sound-raspberry/releases/download/2.5.26-dev.6-alpha3/osmium-rpi-2.5.26-dev.6-alpha3.raucb.sha256",
+      "size": 103
+    }
+  ]
+}
