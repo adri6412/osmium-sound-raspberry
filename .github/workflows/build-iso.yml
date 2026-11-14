@@ -1,0 +1,561 @@
+name: Build HiFi Player ISO (manual)
+
+# Manually rebuilds the installer ISO and (optionally) attaches it to a GitHub
+# Release for a tag you type in by hand.
+#
+#   Actions → "Build HiFi Player ISO (manual)" → Run workflow
+#     • tag         : e.g. v1.0.5  (created on the current commit if missing)
+#     • make_release: attach the ISO to a Release for that tag (default: true)
+#     • lyrion_url  : override the Lyrion .deb URL (optional)
+#     • suite       : Debian suite (default: trixie — labwc/xwayland non
+#                     esistono su bookworm, vedi build-distro.sh)
+#     • usb_image   : also build hifi-player-<tag>.img.xz, the image to write
+#                     straight onto a USB stick (default: true)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build/publish (e.g. v1.0.5)'
+        required: true
+        type: string
+      make_release:
+        description: 'Create/attach a GitHub Release for the tag'
+        required: true
+        type: boolean
+        default: true
+      lyrion_url:
+        description: 'Lyrion Music Server .deb URL (leave empty for default)'
+        required: false
+        type: string
+      suite:
+        description: 'Debian suite'
+        required: false
+        type: string
+        default: 'trixie'
+      # The default since v2.5.24-dev.14: the two-filesystem ISO carried the
+      # same system twice (~2 GB, against GitHub's 2 GiB asset limit). Untick
+      # only to rebuild the historical layout.
+      single_squashfs:
+        description: 'One filesystem: the live system IS the image (~900 MiB smaller). Untick for the old two-filesystem ISO'
+        required: false
+        type: boolean
+        default: true
+      # Next to the ISO, never instead of it: a disk image people write onto
+      # a USB stick (or any disk) with Etcher or Rufus and boot as it is, with
+      # no installer round. The data partition takes the rest of the medium
+      # at the first boot. See distro/build-usb-image.sh.
+      usb_image:
+        description: 'Also build the ready-to-boot USB/disk image (.img.xz) next to the ISO'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  # 🚨 Lavoro a parte, sul runner nudo: costruisce l'interfaccia Qt che finisce
+  # in /opt/hifi-qt dentro l'immagine. Non puo' stare nel lavoro dell'immagine
+  # perche' quello gira DENTRO un contenitore debian:bookworm, e li' docker
+  # (che serve a compilare su base Debian 13) non c'e'. Stesso identico
+  # pacchetto dell'aggiornamento OTA: lo costruisce lo stesso script.
+  qt-payload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build the Qt on-screen interface payload
+        run: bash native-ui-qt/ci/build-payload.sh qtui
+
+      - name: Upload the Qt payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-payload
+          path: qtui
+          retention-days: 1
+          if-no-files-found: error
+
+  # The system image that the installer writes into slot A. Built in its own
+  # chroot (trixie, privileged) exactly like the OTA one: it CANNOT be carved
+  # out of the ISO's live filesystem, which keeps live-boot and is
+  # a different system. --no-bundle stops at the squashfs, so this job needs no
+  # signing keys — the installer copies those blocks straight into the slot.
+  image:
+    # Serve solo alla ISO storica, che porta l'immagine come file a parte.
+    # Nella ISO a filesystem unico il chroot stesso diventa l'immagine e
+    # live-build lo comprime una volta sola.
+    if: ${{ !inputs.single_squashfs }}
+    runs-on: ubuntu-latest
+    # 🚨 It consumes the qt-payload artifact, so it cannot start beside the job
+    # that produces it: without this the download fails with "Artifact not
+    # found" a minute into the run.
+    needs: qt-payload
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: debian:trixie
+      options: --privileged
+      volumes:
+        - /mnt:/mnt
+    steps:
+      - name: Install base tooling
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils sudo python3 build-essential \
+            live-build imagemagick xorriso debootstrap debian-archive-keyring rsync fakeroot \
+            cpio gzip squashfs-tools dosfstools mtools isolinux syslinux-common \
+            rauc e2fsprogs zstd grub-common openssl initramfs-tools-core
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-webui/package-lock.json
+      - uses: actions/download-artifact@v8
+        with:
+          name: qt-payload
+          path: qtui
+      - run: chmod 755 qtui/hifi-qt
+      - name: Build web-admin (Vue)
+        run: (cd admin-webui && npm ci && npm run build)
+      - name: Build the system image (no bundle, no signing)
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          # Recommended albums: the project's Last.fm key (optional, see build-distro.sh)
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p /mnt/image-out
+          export IMAGE_OUT=/mnt/image-out IMAGE_WORK=/mnt IMAGE_VERSION="$INPUT_TAG"
+          chmod +x distro/build-distro.sh distro/build-image.sh
+          cd distro
+          ./build-distro.sh --stage image --suite trixie --no-bundle \
+            --qt-dir "$GITHUB_WORKSPACE/qtui" \
+            --app-version "${INPUT_TAG#v}"
+          ls -lh /mnt/image-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iso-system-image
+          path: /mnt/image-out/hifi-image-*.rootfs.squashfs*
+          retention-days: 3
+          if-no-files-found: error
+
+  # The ready-to-boot disk image. It builds its own system image, the same
+  # one the `image` job builds (and the OTA ships), rather than sharing that
+  # job: build-iso waits for `image`, and tying this one to it would make
+  # every single-filesystem ISO wait for a second image build for nothing.
+  usb-image:
+    if: ${{ inputs.usb_image }}
+    runs-on: ubuntu-latest
+    needs: qt-payload
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: debian:trixie
+      options: --privileged
+      volumes:
+        - /mnt:/mnt
+    steps:
+      - name: Install base tooling
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils sudo python3 build-essential \
+            live-build imagemagick xorriso debootstrap debian-archive-keyring rsync fakeroot \
+            cpio gzip squashfs-tools dosfstools mtools isolinux syslinux-common \
+            rauc e2fsprogs zstd grub-common openssl initramfs-tools-core \
+            fdisk mount util-linux
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-webui/package-lock.json
+      - uses: actions/download-artifact@v8
+        with:
+          name: qt-payload
+          path: qtui
+      - run: chmod 755 qtui/hifi-qt
+      - name: Build web-admin (Vue)
+        run: (cd admin-webui && npm ci && npm run build)
+      - name: Build the system image (no bundle, no signing)
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          # Recommended albums: the project's Last.fm key (optional, see build-distro.sh)
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p /mnt/image-out
+          export IMAGE_OUT=/mnt/image-out IMAGE_WORK=/mnt IMAGE_VERSION="$INPUT_TAG"
+          chmod +x distro/build-distro.sh distro/build-image.sh
+          cd distro
+          ./build-distro.sh --stage image --suite trixie --no-bundle \
+            --qt-dir "$GITHUB_WORKSPACE/qtui" \
+            --app-version "${INPUT_TAG#v}"
+          ls -lh /mnt/image-out
+      - name: Build the disk image
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          # Recommended albums: the project's Last.fm key (optional, see build-distro.sh)
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p /mnt/usb-out
+          SQ=$(ls -1 /mnt/image-out/hifi-image-*.rootfs.squashfs | head -n 1)
+          IMAGE_WORK=/mnt bash distro/build-usb-image.sh --rootfs "$SQ" \
+            --out "/mnt/usb-out/hifi-player-${INPUT_TAG}.img"
+          # xz: what Etcher, Rufus and Raspberry Pi Imager all open as it is.
+          # The empty slot B and ESP cost nothing; the slot is already gzip.
+          xz -T0 -6 -v "/mnt/usb-out/hifi-player-${INPUT_TAG}.img"
+          ls -lh /mnt/usb-out
+      - name: Checksum + sign the disk image
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd /mnt/usb-out
+          IMG="hifi-player-${INPUT_TAG}.img.xz"
+          sha256sum "$IMG" > "$IMG.sha256"
+          # Same offline Ed25519 key and same sidecars as the ISO.
+          if [ -z "$OTA_SIGNING_KEY" ]; then
+            echo "::error::OTA_SIGNING_KEY is not set"
+            exit 1
+          fi
+          printf '%s' "$OTA_SIGNING_KEY" > /tmp/ota-key.pem
+          openssl pkeyutl -sign -inkey /tmp/ota-key.pem -rawin \
+            -in "$IMG.sha256" -out "$IMG.sha256.sig"
+          rm -f /tmp/ota-key.pem
+          openssl pkeyutl -verify -pubin -inkey "$GITHUB_WORKSPACE/distro/ota-keys/ota-pubkey.pem" \
+            -rawin -in "$IMG.sha256" -sigfile "$IMG.sha256.sig" \
+            || { echo "::error::the signature does not verify against the shipped public key"; exit 1; }
+          SZ=$(stat -c %s "$IMG")
+          echo "disk image: $((SZ / 1048576)) MiB"
+          [ "$SZ" -le 2147483648 ] || { echo "::error::$IMG is over the 2 GiB limit for a release asset"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hifi-player-usb-${{ inputs.tag }}
+          path: /mnt/usb-out/hifi-player-*.img.xz*
+          retention-days: 14
+          if-no-files-found: error
+
+  build-iso:
+    runs-on: ubuntu-latest
+    needs: [qt-payload, image]
+    if: ${{ always() && needs.qt-payload.result == 'success' && (inputs.single_squashfs || needs.image.result == 'success') }}
+    timeout-minutes: 120
+    # The debian:bookworm container defaults `run:` steps to sh (dash), which
+    # lacks `set -o pipefail`. Force bash for every step.
+    defaults:
+      run:
+        shell: bash
+    # Build inside a real Debian container so live-build/debootstrap and the
+    # Debian archive keyring behave correctly (Ubuntu hosts can trip on this).
+    container:
+      image: debian:bookworm
+      options: --privileged
+
+    steps:
+      - name: Install base tooling (container is minimal)
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils sudo \
+            python3 build-essential \
+            live-build imagemagick xorriso debootstrap \
+            debian-archive-keyring rsync fakeroot \
+            cpio gzip squashfs-tools dosfstools mtools isolinux syslinux-common \
+            zstd e2fsprogs grub-common initramfs-tools-core
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        # for the web admin's build; the root has no npm project any more
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-webui/package-lock.json
+
+      - name: Fetch the Qt interface built by the qt-payload job
+        uses: actions/download-artifact@v8
+        with:
+          name: qt-payload
+          path: qtui
+
+      - name: Restore the executable bit (artifacts do not carry it)
+        run: |
+          set -eux
+          chmod 755 qtui/hifi-qt
+          if [ -f qtui/hifi-media-player ]; then chmod 755 qtui/hifi-media-player; fi
+          ls -l qtui | head
+
+      - name: Build web-admin (Vue) — injected into the ISO by build-distro.sh
+        # build-distro.sh itself refuses to inject a missing/empty dist, but
+        # fail fast here too rather than burning ~15min of live-build first.
+        run: |
+          if [ -f admin-webui/package.json ]; then
+            (cd admin-webui && npm ci && npm run build)
+          else
+            echo "::error::admin-webui/package.json missing — cannot build the web-admin UI" >&2
+            exit 1
+          fi
+
+      - name: Put the system image on the ISO
+        if: ${{ !inputs.single_squashfs }}
+        uses: actions/download-artifact@v8
+        with:
+          name: iso-system-image
+          path: /tmp/sysimage
+      - name: Stage it where live-build picks it up
+        if: ${{ !inputs.single_squashfs }}
+        run: |
+          set -euo pipefail
+          mkdir -p distro/config/includes.binary/osmium
+          SQ=$(ls -1 /tmp/sysimage/hifi-image-*.rootfs.squashfs | head -n 1)
+          [ -s "$SQ" ] || { echo "::error::the system image is missing"; exit 1; }
+          cp "$SQ" distro/config/includes.binary/osmium/rootfs.squashfs
+          ( cd distro/config/includes.binary/osmium \
+            && sha256sum rootfs.squashfs > rootfs.squashfs.sha256 )
+          ls -lh distro/config/includes.binary/osmium/
+
+      - name: Build installer ISO (live-build, as root)
+        run: |
+          set -euo pipefail
+          ARGS="--app-version ${INPUT_TAG#v} --suite $INPUT_SUITE"
+          # the Qt interface is the only one: build-distro.sh refuses to go on without it
+          ARGS="$ARGS --qt-dir $GITHUB_WORKSPACE/qtui"
+          if [ -n "${INPUT_LYRION_URL}" ]; then
+            ARGS="$ARGS --lyrion-url ${INPUT_LYRION_URL}"
+          fi
+          if [ "${INPUT_SINGLE}" = "true" ]; then
+            # Un solo filesystem: il chroot viene post-processato come immagine
+            # e compresso una volta sola, e quello squashfs fa sia da sistema
+            # live sia da contenuto dello slot A.
+            ARGS="$ARGS --stage iso-image"
+          fi
+          chmod +x distro/build-distro.sh distro/build-image.sh
+          cd distro
+          # Already root inside the container — no sudo needed.
+          ISO_NAME="hifi-player-${INPUT_TAG}.iso" IMAGE_VERSION="${INPUT_TAG}" ./build-distro.sh $ARGS
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          # Recommended albums: the project's Last.fm key (optional, see build-distro.sh)
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_LYRION_URL: ${{ inputs.lyrion_url }}
+          INPUT_SINGLE: ${{ inputs.single_squashfs }}
+
+      - name: Refuse an ISO too large to publish
+        run: |
+          set -euo pipefail
+          # find, not ls in a pipeline: `ls a/*.iso *.iso` returns 2 when one
+          # of the two patterns matches nothing, and under `set -o pipefail`
+          # that killed the job right after a perfectly good ISO had been
+          # built. find reports nothing and exits 0.
+          ISO=$(find . -maxdepth 2 -name '*.iso' -print -quit 2>/dev/null || true)
+          [ -n "$ISO" ] || exit 0
+          SZ=$(stat -c %s "$ISO")
+          echo "ISO size: $((SZ / 1048576)) MiB"
+          # A GitHub release asset cannot exceed 2 GiB (2147483648 bytes), and
+          # the two-filesystem ISO (single_squashfs unticked) carries the system
+          # image as a second copy, ~950 MiB of the total. The hard
+          # stop is the real limit, not a made-up margin: the first version of
+          # this check refused a 1978 MiB ISO that GitHub would have taken
+          # perfectly well. Past 1900 MiB it only warns — that is the point
+          # where the next growth spurt runs out of room and the ISO has to go
+          # to R2 instead.
+          if [ "$SZ" -gt 2147483648 ]; then
+            echo "::error::ISO is $((SZ / 1048576)) MiB — over the 2 GiB limit for a release asset. Trim the image or publish it to R2 instead."
+            exit 1
+          elif [ "$SZ" -gt 1992294400 ]; then
+            echo "::warning::ISO is $((SZ / 1048576)) MiB, close to the 2048 MiB ceiling for a release asset — plan the move to R2."
+          fi
+
+      - name: Locate + checksum + sign the ISO
+        id: iso
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          ISO="hifi-player-${{ inputs.tag }}.iso"
+          [ -f "$ISO" ] || ISO="$(ls -1 *.iso 2>/dev/null | head -n1)"
+          [ -n "$ISO" ] && [ -f "$ISO" ] || { echo "No ISO produced"; exit 1; }
+          sha256sum "$ISO" > "${ISO}.sha256"
+          # Sign the sha256 sidecar with the same offline Ed25519 key used for
+          # OS OTA bundles (see build-ui-ota.yml). Osmium Flasher verifies this
+          # signature before it will write anything, and refuses an unsigned
+          # image outright -- so unlike the OTA job, a missing key is fatal here
+          # rather than a warning.
+          if [ -z "$OTA_SIGNING_KEY" ]; then
+            echo "::error::OTA_SIGNING_KEY is not set -- the ISO would be unusable by Osmium Flasher."
+            exit 1
+          fi
+          printf '%s' "$OTA_SIGNING_KEY" > /tmp/ota-key.pem
+          openssl pkeyutl -sign -inkey /tmp/ota-key.pem -rawin \
+            -in "${ISO}.sha256" -out "${ISO}.sha256.sig"
+          rm -f /tmp/ota-key.pem
+          openssl pkeyutl -verify -pubin -inkey distro/ota-keys/ota-pubkey.pem \
+            -rawin -in "${ISO}.sha256" -sigfile "${ISO}.sha256.sig" \
+            || { echo "::error::the signature does not verify against the shipped public key"; exit 1; }
+          echo "iso=$ISO" >> "$GITHUB_OUTPUT"
+          ls -lh "$ISO" "${ISO}.sha256" "${ISO}.sha256.sig"
+
+      # latest.json is what Osmium Flasher polls to discover the current image.
+      # It goes to file.osmiumsound.it with the ISO, through the publish-iso
+      # job below (publish-iso-r2.yml), once the ISO is on the release.
+      - name: Build the flasher manifest (latest.json)
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/make-iso-manifest.py \
+            "${{ inputs.tag }}" "${{ steps.iso.outputs.iso }}"
+          cp manifest-out/latest.json .
+          cat latest.json
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hifi-player-iso-${{ inputs.tag }}
+          path: |
+            ${{ steps.iso.outputs.iso }}
+            ${{ steps.iso.outputs.iso }}.sha256
+            ${{ steps.iso.outputs.iso }}.sha256.sig
+            latest.json
+          retention-days: 14
+
+      - name: Create tag if missing
+        if: ${{ inputs.make_release }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="${{ inputs.tag }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists."
+          else
+            git tag -a "$TAG" -m "HiFi Player $TAG"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$TAG"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read the release's current visibility
+        id: relstate
+        if: ${{ inputs.make_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # false when the release does not exist yet: then this job creates it
+          # and a visible release is the historical behaviour for an ISO-only
+          # publish.
+          D=$(gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" --json isDraft -q .isDraft 2>/dev/null || echo false)
+          [ "$D" = "true" ] || D=false
+          echo "is_draft=$D" >> "$GITHUB_OUTPUT"
+          echo "release ${{ inputs.tag }}: draft=$D (left as it is)"
+
+      - name: Publish ISO to GitHub Release
+        if: ${{ inputs.make_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          # No `name:` on purpose. A release is named after its tag and nothing
+          # else — "v2.5.21-dev.37", never "HiFi Player v2.5.21-dev.37". This
+          # job usually attaches an ISO to a release the tag push already
+          # created, but when it runs first it creates the release itself, and
+          # a name here would stick.
+          fail_on_unmatched_files: true
+          # Same rule as build-ui-ota.yml: a hyphenated tag (dev/alpha build)
+          # is a prerelease, so it never becomes /releases/latest and can't
+          # be mistaken for a stable prod release by the OTA fallback path.
+          prerelease: ${{ contains(inputs.tag, '-') }}
+          # 🚨 Attaching an ISO must not decide whether a release is visible.
+          # The OTA build keeps it a draft until the system image is on it too,
+          # and this job can perfectly well run while that is still building;
+          # left alone, the action would clear the draft flag and expose a
+          # release whose image does not exist yet. It must not re-draft an
+          # already published one either, which is why the state is read first
+          # and handed back unchanged rather than decided here.
+          draft: ${{ steps.relstate.outputs.is_draft }}
+          files: |
+            ${{ steps.iso.outputs.iso }}
+            ${{ steps.iso.outputs.iso }}.sha256
+            ${{ steps.iso.outputs.iso }}.sha256.sig
+
+  # The disk image onto the same release, once build-iso has made sure the
+  # tag and the release exist: two jobs creating them at once would race.
+  usb-release:
+    runs-on: ubuntu-latest
+    needs: [build-iso, usb-image]
+    # always(): build-iso needs `image`, which the single-filesystem ISO skips,
+    # and without it a skipped ancestor skips this job too (alpha27 shipped
+    # without its disk image that way).
+    if: ${{ always() && inputs.make_release && inputs.usb_image && needs.build-iso.result == 'success' && needs.usb-image.result == 'success' }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: hifi-player-usb-${{ inputs.tag }}
+          path: usb
+      - name: Read the release's current visibility
+        id: relstate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same rule as build-iso: attaching a file never decides whether
+          # the release is visible.
+          D=$(gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" --json isDraft -q .isDraft 2>/dev/null || echo false)
+          [ "$D" = "true" ] || D=false
+          echo "is_draft=$D" >> "$GITHUB_OUTPUT"
+          ls -lh usb
+      - name: Publish the disk image to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(inputs.tag, '-') }}
+          draft: ${{ steps.relstate.outputs.is_draft }}
+          files: |
+            usb/hifi-player-${{ inputs.tag }}.img.xz
+            usb/hifi-player-${{ inputs.tag }}.img.xz.sha256
+            usb/hifi-player-${{ inputs.tag }}.img.xz.sha256.sig
+
+  # The stable ISO, its sidecars and latest.json to the root of the bucket
+  # behind file.osmiumsound.it, where the site links it and the flasher looks
+  # for it. Reads the files back from the release, so it also runs by hand.
+  # After usb-release, so the disk image goes along when there is one; a
+  # failed or skipped disk image never holds the ISO back.
+  publish-iso:
+    needs: [build-iso, usb-release]
+    # Production (vX.Y.Z) and development (vX.Y.Z-dev.N) go to
+    # file.osmiumsound.it, the two channels Osmium Flasher offers; an alpha
+    # stays on its GitHub release.
+    if: ${{ always() && needs.build-iso.result == 'success' && inputs.make_release && (!contains(inputs.tag, '-') || (contains(inputs.tag, '-dev.') && !contains(inputs.tag, '-alpha'))) }}
+    uses: ./.github/workflows/publish-iso-r2.yml
+    with:
+      tag: ${{ inputs.tag }}
+    secrets: inherit

@@ -1,0 +1,33 @@
+[system]
+compatible=osmium-rpi
+bootloader=custom
+# Persistent RAUC state lives on /data (the only writable partition; root is a
+# read-only squashfs). /data is mounted by the initramfs before RAUC runs.
+data-directory=/data/rauc
+# bootname of the slot the running system booted, parsed from rauc.slot= on the
+# kernel command line (set per slot in cmdline.txt).
+bootloaders-state=/data/rauc
+
+[keyring]
+path=/etc/rauc/keyring.pem
+
+[handlers]
+# Custom bootloader backend for the Pi firmware tryboot A/B scheme.
+# 🚨 VERIFY the exact option name against the installed RAUC version: recent
+# RAUC expects the custom backend here as `bootloader-custom-backend=`. If the
+# build's RAUC rejects this key, move the path to the documented option for that
+# release (the backend script itself is correct either way).
+bootloader-custom-backend=/usr/local/sbin/hifi-rpi-boot.sh
+
+# Slots: the two raw squashfs roots, addressed by GPT PARTLABEL (udev creates
+# /dev/disk/by-partlabel from the labels build-image-rpi.sh writes). bootname
+# A/B is what the custom backend and rauc.slot= use.
+[slot.rootfs.0]
+device=/dev/disk/by-partlabel/hifi-root-a
+type=raw
+bootname=A
+
+[slot.rootfs.1]
+device=/dev/disk/by-partlabel/hifi-root-b
+type=raw
+bootname=B

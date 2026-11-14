@@ -1,0 +1,44 @@
+# Pacchetti base per X11 (minimo indispensabile)
+xserver-xorg-core
+xserver-xorg-video-all
+xserver-xorg-input-all
+xinit
+lightdm
+
+# Supporto Audio ALSA Bit-perfect
+alsa-utils
+libasound2
+
+# Dipendenze tipiche di Electron su Debian Minimal
+libnss3
+libxss1
+libasound2
+libatk1.0-0
+libatk-bridge2.0-0
+libgdk-pixbuf2.0-0
+libgtk-3-0
+libdrm2
+libgbm1
+libx11-xcb1
+libxcb-dri3-0
+libxshmfence1
+
+# Network Manager se ti serve connettere al WiFi o gestire IP
+network-manager
+
+# Utilità essenziali
+sudo
+curl
+ca-certificates
+unzip
+
+# NTP time sync — NOT bundled into the base systemd package on Debian 12
+# (confirmed live: `systemctl status systemd-timesyncd` -> "could not be
+# found" on a device that only had `systemd`/`systemd-sysv` installed).
+# Needed explicitly, or 0400-enable-services.hook.chroot's `systemctl enable`
+# silently no-ops and every fresh install boots with no time sync at all.
+systemd-timesyncd
+
+# Installer
+calamares
+calamares-settings-debian

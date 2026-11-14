@@ -1,0 +1,335 @@
+name: Build Osmium Raspberry Pi image (manual)
+
+# Builds the Osmium Sound image for the Raspberry Pi 4 AND Pi 5 (one image, both
+# boards; full feature parity with x86 — bundled Lyrion, DSP, CD ripping, web
+# admin, Bluetooth) on a native arm64 runner. Mirror of the x86 build-iso.yml,
+# but there is no live ISO and no GRUB: the Pi boots through its firmware tryboot
+# A/B scheme (autoboot.txt + boot_partition), and the image is a RAUC A/B disk.
+#
+#   Actions -> "Build Osmium Raspberry Pi image (manual)" -> Run workflow
+#     • version : e.g. 2.5.26-dev.6-alpha3 (goes into IMAGE_VERSION / RAUC manifest)
+#     • suite   : Debian suite (default: trixie — Qt6 needs Debian 13)
+#     • sign    : sign the RAUC bundle with the repo secrets (default: true).
+#     • publish : cut a GitHub Release + mirror to R2/Pages for OTA (needs sign).
+#
+# Signing keys come from repository secrets, NEVER from the tree:
+#   RAUC_SIGNING_CERT / RAUC_SIGNING_KEY  the X.509 cert+key for the .raucb
+#   OTA_SIGNING_KEY                       the Ed25519 key for the .img sidecar
+# The public keyring (distro/rauc-keys/keyring.pem) and OTA pubkey
+# (distro/ota-keys/ota-pubkey.pem) are checked in and used to verify.
+#
+# OTA reaches devices three ways (api_server.py): the Cloudflare Pages manifest
+# (osmium-sound-raspberry.pages.dev/ota — a Pages project the operator points at
+# this repo's gh-pages branch), the R2 mirror (file.osmiumsound.it/ota-rpi), and
+# the GitHub Releases API as the always-available fallback. Publishing the
+# Release alone already makes OTA work; the Pages/R2 steps just avoid the API
+# rate limit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image version (e.g. 2.5.26-dev.6-alpha3)'
+        required: true
+        type: string
+      suite:
+        description: 'Debian suite'
+        required: false
+        type: string
+        default: 'trixie'
+      sign:
+        description: 'Sign the RAUC bundle with the repo secrets (untick for an unsigned test build)'
+        required: false
+        type: boolean
+        default: true
+      publish:
+        description: 'Publish a Release + R2/Pages manifest for OTA (needs sign=true). Off = artifacts only, no tag.'
+        required: false
+        type: boolean
+        default: false
+
+# contents: write is needed by the optional publish steps (gh release + gh-pages
+# push); harmless when publish=false (those steps are skipped).
+permissions:
+  contents: write
+
+jobs:
+  # 🚨 On the bare arm64 runner, not in a container: build-payload.sh builds the
+  # Qt interface natively inside a `debian:trixie` docker container, which on an
+  # arm64 runner is arm64 — a real aarch64 build, no qemu. It cannot run inside
+  # the image container (no docker there), same reason as the x86 ISO.
+  qt-payload:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build the Qt on-screen interface payload (arm64)
+        run: bash native-ui-qt/ci/build-payload.sh qtui
+
+      - name: Verify the payload really is aarch64
+        run: |
+          set -eu
+          file qtui/hifi-qt || true
+          mach=$(od -An -tu1 -j18 -N1 qtui/hifi-qt | tr -d ' ')
+          [ "$mach" = 183 ] || { echo "::error::qtui/hifi-qt is not an aarch64 ELF (e_machine=$mach, want 183)"; exit 1; }
+
+      - name: Upload the Qt payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-payload
+          path: qtui
+          retention-days: 1
+          if-no-files-found: error
+
+  # The system image (rootfs.squashfs + the RAUC bundle) and the flashable
+  # SD/USB .img. Built in a privileged debian:trixie container on the arm64
+  # runner, so debootstrap/mksquashfs/losetup/rauc all run native arm64.
+  image:
+    runs-on: ubuntu-24.04-arm
+    needs: qt-payload
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: debian:trixie
+      options: --privileged
+      volumes:
+        - /mnt:/mnt
+    steps:
+      - name: Install base tooling (container is minimal)
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils sudo python3 build-essential \
+            debootstrap debian-archive-keyring rsync fakeroot \
+            squashfs-tools dosfstools mtools \
+            rauc e2fsprogs zstd openssl initramfs-tools-core \
+            file fdisk gdisk mount util-linux awscli
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-webui/package-lock.json
+
+      - name: Fetch the Qt interface built by the qt-payload job
+        uses: actions/download-artifact@v8
+        with:
+          name: qt-payload
+          path: qtui
+
+      - name: Build web-admin (Vue)
+        run: |
+          if [ -f admin-webui/package.json ]; then
+            (cd admin-webui && npm ci && npm run build)
+          else
+            echo "::error::admin-webui/package.json missing — cannot build the web-admin UI" >&2
+            exit 1
+          fi
+
+      - name: Inject the payloads into includes.chroot
+        run: |
+          set -eux
+          chmod 755 qtui/hifi-qt
+          [ -f qtui/hifi-media-player ] && chmod 755 qtui/hifi-media-player || true
+          QT_DEST=distro/config/includes.chroot/opt/hifi-qt
+          WEBUI_DEST=distro/config/includes.chroot/opt/hifi-webui/dist
+          mkdir -p "$QT_DEST" "$WEBUI_DEST"
+          cp -a qtui/. "$QT_DEST/"
+          [ -f admin-webui/dist/index.html ] || { echo "::error::admin-webui/dist missing after build"; exit 1; }
+          cp -a admin-webui/dist/. "$WEBUI_DEST/"
+
+      - name: Work out the OTA channel from the version
+        id: channel
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -eu
+          case "$V" in
+            *-*alpha*) CH=alpha ;;
+            *-*)       CH=dev ;;
+            *)         CH=prod ;;
+          esac
+          echo "channel=$CH" >> "$GITHUB_OUTPUT"
+          case "$V" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac >> "$GITHUB_OUTPUT"
+
+      - name: Build the Raspberry Pi system image (+ RAUC bundle)
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_SIGN: ${{ inputs.sign }}
+          RAUC_SIGNING_CERT: ${{ secrets.RAUC_SIGNING_CERT }}
+          RAUC_SIGNING_KEY: ${{ secrets.RAUC_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p /mnt/rpi-out
+          export IMAGE_OUT=/mnt/rpi-out IMAGE_WORK=/mnt
+          chmod +x distro/build-rpi.sh distro/build-image-rpi.sh
+          ARGS=(--version "$INPUT_VERSION" --suite "$INPUT_SUITE")
+          if [ "$INPUT_SIGN" = "true" ]; then
+            if [ -z "${RAUC_SIGNING_CERT:-}" ] || [ -z "${RAUC_SIGNING_KEY:-}" ]; then
+              echo "::error::sign=true but RAUC_SIGNING_CERT / RAUC_SIGNING_KEY secrets are not set"
+              exit 1
+            fi
+            umask 077
+            printf '%s' "$RAUC_SIGNING_CERT" > "$RUNNER_TEMP/rauc-cert.pem"
+            printf '%s' "$RAUC_SIGNING_KEY"  > "$RUNNER_TEMP/rauc-key.pem"
+            ARGS+=(--cert "$RUNNER_TEMP/rauc-cert.pem" --key "$RUNNER_TEMP/rauc-key.pem" --keep-rootfs)
+          else
+            ARGS+=(--no-bundle)
+          fi
+          ./distro/build-rpi.sh "${ARGS[@]}"
+          rm -f "$RUNNER_TEMP/rauc-cert.pem" "$RUNNER_TEMP/rauc-key.pem"
+          ls -lh /mnt/rpi-out
+
+      - name: Assemble the flashable SD/USB image
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          SQ="/mnt/rpi-out/osmium-rpi-${INPUT_VERSION}.rootfs.squashfs"
+          [ -f "$SQ" ] || { echo "::error::rootfs.squashfs not found: $SQ"; exit 1; }
+          IMAGE_WORK=/mnt ./distro/build-image-rpi.sh \
+            --rootfs "$SQ" \
+            --out "/mnt/rpi-out/osmium-rpi-${INPUT_VERSION}.img"
+          xz -T0 -6 -v "/mnt/rpi-out/osmium-rpi-${INPUT_VERSION}.img"
+          ls -lh /mnt/rpi-out
+
+      - name: Checksum + sign the artifacts
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SIGN: ${{ inputs.sign }}
+        run: |
+          set -euo pipefail
+          cd /mnt/rpi-out
+          IMG="osmium-rpi-${INPUT_VERSION}.img.xz"
+          sha256sum "$IMG" > "$IMG.sha256"
+          if [ "$INPUT_SIGN" = "true" ] && [ -f "osmium-rpi-${INPUT_VERSION}.raucb" ]; then
+            sha256sum "osmium-rpi-${INPUT_VERSION}.raucb" > "osmium-rpi-${INPUT_VERSION}.raucb.sha256"
+          fi
+          if [ -z "${OTA_SIGNING_KEY:-}" ]; then
+            echo "::notice::OTA_SIGNING_KEY not set — disk image left unsigned (checksum only)"
+          else
+            umask 077
+            printf '%s' "$OTA_SIGNING_KEY" > "$RUNNER_TEMP/ota-key.pem"
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/ota-key.pem" -rawin \
+              -in "$IMG.sha256" -out "$IMG.sha256.sig"
+            rm -f "$RUNNER_TEMP/ota-key.pem"
+            openssl pkeyutl -verify -pubin \
+              -inkey "$GITHUB_WORKSPACE/distro/ota-keys/ota-pubkey.pem" \
+              -rawin -in "$IMG.sha256" -sigfile "$IMG.sha256.sig" \
+              || { echo "::error::the signature does not verify against the shipped public key"; exit 1; }
+          fi
+          ls -lh
+
+      - name: Upload the RAUC bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: osmium-rpi-raucb-${{ inputs.version }}
+          path: |
+            /mnt/rpi-out/osmium-rpi-*.raucb*
+            /mnt/rpi-out/osmium-rpi-*.info.txt
+            /mnt/rpi-out/osmium-rpi-*.build-info.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload the flashable disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: osmium-rpi-img-${{ inputs.version }}
+          path: /mnt/rpi-out/osmium-rpi-*.img.xz*
+          retention-days: 14
+          if-no-files-found: error
+
+      # ── OTA publish (opt-in, needs sign) ──────────────────────────────────
+      # 🚨 The only steps that create a tag/Release or touch the CDN. They run
+      # only when the operator ticks `publish` AND `sign`, so no tag is cut on a
+      # plain build.
+      - name: Publish GitHub Release (OTA)
+        if: ${{ inputs.publish && inputs.sign }}
+        uses: softprops/action-gh-release@v2.2.1
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body: "Osmium Sound image ${{ inputs.version }} for Raspberry Pi 4 & Pi 5 (RAUC A/B bundle for OTA, plus the flashable SD/USB image)."
+          prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.channel.outputs.channel == 'prod' }}
+          fail_on_unmatched_files: true
+          files: |
+            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.raucb
+            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.raucb.sha256
+            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.img.xz
+            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.img.xz.sha256
+            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.info.txt
+
+      # The device reads latest-<channel>.json from Cloudflare Pages first; the
+      # Release CDN serves the .raucb named in it. Push it to gh-pages/ota (the
+      # branch the Pages project watches).
+      - name: Build the OTA Pages manifest
+        if: ${{ inputs.publish && inputs.sign }}
+        id: pages_manifest
+        env:
+          EXTRA_ASSETS: osmium-rpi-${{ inputs.version }}.raucb osmium-rpi-${{ inputs.version }}.raucb.sha256
+        run: |
+          set -euo pipefail
+          cd /mnt/rpi-out
+          # Empty ui/sys/os tar args: this is an image-only release (the manifest
+          # script drops the empty names; the .raucb comes via EXTRA_ASSETS).
+          python3 "$GITHUB_WORKSPACE/.github/scripts/make-ota-manifest.py" \
+            "${{ inputs.version }}" "${{ github.repository }}" \
+            "${{ steps.channel.outputs.channel }}" "" "" ""
+          mkdir -p "$GITHUB_WORKSPACE/pages-ota/ota"
+          cp "manifest-out/latest-${{ steps.channel.outputs.channel }}.json" \
+             "$GITHUB_WORKSPACE/pages-ota/ota/"
+          cat "manifest-out/latest-${{ steps.channel.outputs.channel }}.json"
+
+      - name: Push OTA manifest to gh-pages branch
+        if: ${{ inputs.publish && inputs.sign }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./pages-ota
+          publish_branch: gh-pages
+          keep_files: true
+
+      # R2 mirror: a copy of the bundle and the channel manifest at
+      # file.osmiumsound.it/ota-rpi, read when Pages is unreachable, before the
+      # rate-limited GitHub API. OTA_ASSET_BASE rewrites the manifest URLs to R2.
+      - name: Mirror the bundle + manifest to R2
+        if: ${{ inputs.publish && inputs.sign }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: osmium-sound-iso-beta
+          CH: ${{ steps.channel.outputs.channel }}
+          TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ] || [ -z "${R2_ENDPOINT:-}" ]; then
+            echo "::warning::R2 secrets not set — skipping the R2 mirror (Pages + GitHub API still serve OTA)"
+            exit 0
+          fi
+          cd /mnt/rpi-out
+          for f in "osmium-rpi-$TAG.raucb" "osmium-rpi-$TAG.raucb.sha256"; do
+            aws s3 cp "$f" "s3://$R2_BUCKET/ota-rpi/$TAG/$f" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          done
+          OTA_ASSET_BASE="https://file.osmiumsound.it/ota-rpi/$TAG" \
+          EXTRA_ASSETS="osmium-rpi-$TAG.raucb osmium-rpi-$TAG.raucb.sha256" \
+            python3 "$GITHUB_WORKSPACE/.github/scripts/make-ota-manifest.py" \
+              "$TAG" "${{ github.repository }}" "$CH" "" "" ""
+          aws s3 cp "manifest-out/latest-$CH.json" "s3://$R2_BUCKET/ota-rpi/latest-$CH.json" \
+            --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --only-show-errors
+          echo "mirrored osmium-rpi-$TAG.raucb and latest-$CH.json to R2 (ota-rpi/)"

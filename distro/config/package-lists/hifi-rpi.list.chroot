@@ -1,0 +1,184 @@
+# ── Osmium Sound appliance — package list (Raspberry Pi 4 + Pi 5, arm64) ──
+# FULL-FEATURE: functionally identical to the x86 hifi.list.chroot. This is
+# that list, minus the x86-only boot chain / GPU tools / Intel-Atheros Wi-Fi
+# firmware, plus the Raspberry GLES/KMS stack and Pi tools. The Pi downstream
+# kernels (linux-image-rpi-v8 + linux-image-rpi-2712), raspi-firmware and
+# rpi-eeprom are installed EXPLICITLY by build-rpi.sh, not from this list, so a
+# typo here can never drop the kernel.
+#
+# One package per line, NO inline comments (apt gets whole lines).
+#
+# Removed vs. x86 (and why):
+#   linux-image-6.12.113+deb13-amd64   x86 kernel pin → Pi downstream kernels
+#   grub-efi-amd64-signed grub-pc-bin shim-signed efibootmgr   no GRUB (firmware tryboot)
+#   firmware-linux-free firmware-linux-nonfree firmware-iwlwifi firmware-atheros
+#                                      x86 CPU microcode / Intel+Atheros blobs
+#   intel-gpu-tools radeontop          x86/AMD GPU busy% → vcgencmd on the Pi
+#
+# Added vs. x86 (arm/Pi):
+#   the Mesa GLES/KMS userland the Qt eglfs kiosk needs on VideoCore (vc4/v3d)
+#   libraspberrypi-bin (vcgencmd + vcmailbox: GPU busy% + tryboot flag)
+#   systemd-sysv fdisk gdisk (debootstrap minbase is leaner than live-build)
+
+# ── Network time (separate package since Debian 12) ──────────────────────
+systemd-timesyncd
+
+# ── Firmware — Wi-Fi/BT for the Pi radio + common USB dongles ─────────────
+# 🚨 firmware-brcm80211 is the on-board Pi Wi-Fi/Bluetooth firmware: never drop.
+firmware-brcm80211
+firmware-misc-nonfree
+firmware-realtek
+wireless-regdb
+wpasupplicant
+
+# ── Raspberry Pi GLES / KMS userland for the Qt eglfs kiosk ───────────────
+# The kiosk runs QT_QPA_PLATFORM=eglfs straight on DRM/KMS over vc4/v3d (same
+# platform the x86 build uses), so it needs Mesa's GLES/EGL/GBM, not X.
+libgl1-mesa-dri
+libglx-mesa0
+libegl1
+libegl-mesa0
+libgles2
+libgbm1
+libdrm2
+libinput10
+libxkbcommon0
+
+# ── Pi tools: vcgencmd (GPU busy% for the dashboard) + vcmailbox (tryboot) ─
+libraspberrypi-bin
+
+# ── Xorg legacy fallback (kiosk default is eglfs; X kept as a safety net) ──
+xserver-xorg-core
+xserver-xorg-video-all
+xserver-xorg-input-all
+x11-xserver-utils
+xinit
+lightdm
+unclutter
+labwc
+wlr-randr
+xwayland
+
+# ── Fonts (CJK glyphs + Latin/Cyrillic/Greek base) ───────────────────────
+fonts-noto-cjk
+fonts-dejavu-core
+
+# ── Audio ────────────────────────────────────────────────────────────────
+alsa-utils
+libasound2
+
+# ── Audio CD support (Lyrion "CD Player" plugin reads the optical drive) ──
+cdparanoia
+libcdio-utils
+icedax
+
+# ── CD ripping to library (hifi-rip-cd.py: encode + tag + TOC + eject) ────
+flac
+cd-discid
+eject
+
+# ── Lyrion Music Server transcoding helpers (convert.conf shells to these) ─
+lame
+faad
+sox
+wavpack
+ffmpeg
+
+# ── Squeezelite (Debian build has VISEXPORT; -v exports /dev/shm) ─────────
+squeezelite
+
+# ── Bluetooth speakers (A2DP source) ─────────────────────────────────────
+bluez
+bluez-tools
+bluez-alsa-utils
+libasound2-plugin-bluez
+
+# ── Python services (api_server.py + vu_meter_daemon.py + sources_server.py) ─
+python3
+python3-flask
+python3-flask-cors
+python3-psutil
+python3-websockets
+python3-yaml
+python3-numpy
+python3-onnxruntime
+python3-mutagen
+
+# ── Network shares (SMB mounting + serving internal disks) ───────────────
+cifs-utils
+samba
+smbclient
+exfatprogs
+ntfs-3g
+wsdd2
+
+# ── Installer / image helpers ────────────────────────────────────────────
+squashfs-tools
+dosfstools
+fdisk
+gdisk
+e2fsprogs
+
+# ── mDNS/Bonjour discovery ───────────────────────────────────────────────
+avahi-daemon
+avahi-utils
+libnss-mdns
+
+# ── Lyrion Music Server runtime dependencies (the .deb is _all/arch-neutral) ─
+perl
+libio-socket-ssl-perl
+libcrypt-openssl-rsa-perl
+psmisc
+procps
+
+# ── Boot splash (hidden/branded boot via plymouth) ───────────────────────
+plymouth
+plymouth-themes
+
+# ── System / networking ──────────────────────────────────────────────────
+sudo
+openssh-server
+curl
+ca-certificates
+openssl
+isc-dhcp-client
+iproute2
+network-manager
+dnsmasq-base
+locales
+systemd-sysv
+
+# ── Automatic security updates ───────────────────────────────────────────
+unattended-upgrades
+
+# ── Log rotation for /var/log/hifi/*.log ─────────────────────────────────
+logrotate
+
+# ── lspci — GPU/HW model strings for the admin dashboard ─────────────────
+pciutils
+
+# ── Second interface (Qt 6 Quick, DRM/KMS direct) — the default kiosk ─────
+kbd
+qt6-qpa-plugins
+libqt6dbus6
+qt6-image-formats-plugins
+qml6-module-qtquick
+qml6-module-qtquick-window
+qml6-module-qtquick-effects
+qml6-module-qtquick-shapes
+qml6-module-qtquick-vectorimage
+qml6-module-qtqml-workerscript
+
+# ── A/B scheme (RAUC) ────────────────────────────────────────────────────
+rauc
+rauc-service
+zstd
+busybox
+
+# ── Compressed swap in RAM (no disk swap on the appliance) ───────────────
+systemd-zram-generator
+systemd-oomd
+
+# ── NIC power-saving off (hifi-nic-powersave-off.sh) ─────────────────────
+iw
+ethtool

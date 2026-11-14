@@ -1,0 +1,37 @@
+# Osmium Sound — Raspberry Pi 4 + Pi 5 A/B selector (firmware tryboot).
+#
+# This file lives on the FIRST FAT partition of the disk (hifi-rpifw, p1). The
+# Pi's EEPROM bootloader reads it BEFORE anything else and uses it to choose
+# which FAT partition holds the config.txt + kernel to boot — that is how A/B
+# works here, with no U-Boot and no GRUB (U-Boot has no PCIe/USB on the Pi 5).
+#
+# tryboot_a_b=1 turns on the firmware's built-in A/B: a NORMAL boot uses the
+# [all] boot_partition; a TRYBOOT reboot (`reboot "0 tryboot"`, or the vcmailbox
+# tryboot flag) uses the [tryboot] boot_partition for exactly ONE boot and then
+# the firmware falls back to [all] on the next reset. That one-shot is the
+# hardware rollback: a freshly-updated slot that fails to come up is abandoned
+# automatically, with no counter to get stuck.
+#
+# Partition map written by build-image-rpi.sh (GPT):
+#   p1 hifi-rpifw   this file + a firmware fallback
+#   p2 hifi-boot-a  slot A boot set (config.txt, cmdline.txt, kernels, DTBs)
+#   p3 hifi-boot-b  slot B boot set
+#   p4 hifi-root-a  slot A root (squashfs, raw)
+#   p5 hifi-root-b  slot B root (squashfs, raw)
+#   p6 hifi-data    persistent /data
+#
+# 🚨 Requires a Pi EEPROM recent enough for [boot_partition] in autoboot.txt
+# (rpi-eeprom ≥ 2025-03-10 / the "latest" channel). rpi-eeprom ships in the
+# image; the factory .img ships a current EEPROM, and OTA can refresh it.
+#
+# The custom RAUC backend (/usr/local/sbin/hifi-rpi-boot.sh) rewrites the two
+# boot_partition numbers below to make a slot permanent (swap 2↔3). 🚨 Keep the
+# section markers and the `boot_partition=` keys exactly as written — that
+# script edits these lines by pattern.
+
+[all]
+tryboot_a_b=1
+boot_partition=2
+
+[tryboot]
+boot_partition=3

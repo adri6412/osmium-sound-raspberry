@@ -1,0 +1,38 @@
+# Osmium Sound — Raspberry Pi 4 + Pi 5, config.txt (per boot partition A/B).
+#
+# One copy sits on EACH boot FAT (hifi-boot-a / hifi-boot-b). It is identical
+# for both slots: what differs per slot is cmdline.txt (root= and rauc.slot=).
+# The VideoCore firmware reads this, then auto-selects the kernel by board
+# (kernel8.img on the Pi 4 / BCM2711, kernel_2712.img on the Pi 5 / BCM2712),
+# so NO explicit `kernel=` line is needed — raspi-firmware names the images
+# exactly as the firmware expects. The initramfs name IS board-specific, so it
+# is set under the [pi4]/[pi5] filters below.
+
+arm_64bit=1
+arm_boost=1
+disable_overscan=1
+# No rainbow splash; plymouth owns the screen from early boot.
+disable_splash=1
+# Serial console on the GPIO header for headless bring-up; free in production.
+enable_uart=1
+
+[pi4]
+# Pi 4 (BCM2711): KMS driver + the matching initramfs raspi-firmware produced.
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+initramfs initramfs8 followkernel
+
+[pi5]
+# Pi 5 (BCM2712 / RP1): the Pi-5 KMS overlay + its initramfs.
+dtoverlay=vc4-kms-v3d-pi5
+max_framebuffers=2
+initramfs initramfs_2712 followkernel
+
+[all]
+# On-board analogue/HDMI audio off: this is a source for USB/I2S DACs. A USB DAC
+# needs no overlay; for an I2S HAT, uncomment exactly one line below.
+dtparam=audio=off
+#dtoverlay=hifiberry-dacplus
+#dtoverlay=allo-boss-dac-pcm512x-audio
+#dtoverlay=iqaudio-dacplus
+# The Pi has no hardware RTC; NTP (systemd-timesyncd) sets the clock at boot.
