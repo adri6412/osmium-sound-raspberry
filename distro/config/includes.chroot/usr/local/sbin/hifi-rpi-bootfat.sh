@@ -54,11 +54,19 @@ copy_flavour() {   # <flavour-suffix> <kernel-dest> <initramfs-dest>
     log "$_kd / $_id  ←  $(basename "$_vmlinuz")"
     # DTBs + overlays ship beside this kernel's modules, under
     # /usr/lib/linux-image-<kver>/broadcom (kver = vmlinuz basename minus prefix).
+    # overlays/ may sit under broadcom/ or one level up, depending on the kernel
+    # package — copy whichever exists. (Plain `test && {…}` would abort the whole
+    # script under `set -e` when the dir is absent, so use if/then.)
     _dtbdir="$SQ/usr/lib/linux-image-$(basename "$_vmlinuz" | sed 's/^vmlinuz-//')"
     if [ -d "$_dtbdir/broadcom" ]; then
         cp -a "$_dtbdir"/broadcom/*.dtb "$FAT"/ 2>/dev/null || true
-        [ -d "$_dtbdir/broadcom/overlays" ] && { mkdir -p "$FAT/overlays"; cp -a "$_dtbdir"/broadcom/overlays/* "$FAT/overlays/" 2>/dev/null || true; }
     fi
+    for _ov in "$_dtbdir/broadcom/overlays" "$_dtbdir/overlays"; do
+        if [ -d "$_ov" ]; then
+            mkdir -p "$FAT/overlays"
+            cp -a "$_ov"/* "$FAT/overlays/" 2>/dev/null || true
+        fi
+    done
 }
 copy_flavour "-rpi-v8"   "kernel8.img"      "initramfs8"
 copy_flavour "-rpi-2712" "kernel_2712.img"  "initramfs_2712"
@@ -67,7 +75,10 @@ copy_flavour "-rpi-2712" "kernel_2712.img"  "initramfs_2712"
 # /boot/firmware (harmless if absent; the asserts above already guaranteed DTBs).
 if [ -d "$SQ/boot/firmware" ]; then
     cp -a "$SQ"/boot/firmware/*.dtb "$FAT"/ 2>/dev/null || true
-    [ -d "$SQ/boot/firmware/overlays" ] && { mkdir -p "$FAT/overlays"; cp -a "$SQ"/boot/firmware/overlays/* "$FAT/overlays/" 2>/dev/null || true; }
+    if [ -d "$SQ/boot/firmware/overlays" ]; then
+        mkdir -p "$FAT/overlays"
+        cp -a "$SQ"/boot/firmware/overlays/* "$FAT/overlays/" 2>/dev/null || true
+    fi
 fi
 ls "$FAT"/bcm2711-*.dtb >/dev/null 2>&1 || die "no Pi 4 (bcm2711-*) DTB landed on the boot FAT"
 ls "$FAT"/bcm2712-*.dtb >/dev/null 2>&1 || die "no Pi 5 (bcm2712-*) DTB landed on the boot FAT"
