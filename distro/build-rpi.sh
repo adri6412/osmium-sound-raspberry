@@ -179,7 +179,7 @@ Package: *
 Pin: origin archive.raspberrypi.com
 Pin-Priority: 100
 
-Package: linux-image-rpi-v8 linux-image-rpi-2712 linux-headers-rpi-v8 linux-headers-rpi-2712 raspi-firmware rpi-eeprom rpi-eeprom-images libraspberrypi0 libraspberrypi-bin
+Package: linux-image-rpi-v8 linux-image-rpi-2712 linux-headers-rpi-v8 linux-headers-rpi-2712 raspi-firmware rpi-eeprom rpi-eeprom-images raspi-utils-core
 Pin: origin archive.raspberrypi.com
 Pin-Priority: 990
 PREF

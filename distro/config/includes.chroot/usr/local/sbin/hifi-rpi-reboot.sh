@@ -42,7 +42,7 @@ do_tryboot() {
     # Preferred: pass "tryboot" to the firmware through the reboot syscall arg.
     if reboot "0 tryboot" 2>/dev/null; then exit 0; fi
     # Fallback: set the tryboot flag via the VideoCore mailbox, then reboot.
-    # 🚨 Needs /dev/vcio (downstream kernel) and libraspberrypi-bin's vcmailbox.
+    # 🚨 Needs /dev/vcio (downstream kernel) and raspi-utils-core's vcmailbox.
     if command -v vcmailbox >/dev/null 2>&1; then
         vcmailbox 0x00038064 4 4 0 1 >/dev/null 2>&1 || true
     fi

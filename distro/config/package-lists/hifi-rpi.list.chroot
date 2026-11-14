@@ -17,7 +17,7 @@
 #
 # Added vs. x86 (arm/Pi):
 #   the Mesa GLES/KMS userland the Qt eglfs kiosk needs on VideoCore (vc4/v3d)
-#   libraspberrypi-bin (vcgencmd + vcmailbox: GPU busy% + tryboot flag)
+#   raspi-utils-core (vcgencmd + vcmailbox: GPU busy% + tryboot flag)
 #   systemd-sysv fdisk gdisk (debootstrap minbase is leaner than live-build)
 
 # ── Network time (separate package since Debian 12) ──────────────────────
@@ -45,7 +45,9 @@ libinput10
 libxkbcommon0
 
 # ── Pi tools: vcgencmd (GPU busy% for the dashboard) + vcmailbox (tryboot) ─
-libraspberrypi-bin
+# On trixie the old libraspberrypi-bin is gone; vcgencmd + vcmailbox ship in
+# raspi-utils-core (archive.raspberrypi.com/debian trixie).
+raspi-utils-core
 
 # ── Xorg legacy fallback (kiosk default is eglfs; X kept as a safety net) ──
 xserver-xorg-core
