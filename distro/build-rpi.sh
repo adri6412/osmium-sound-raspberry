@@ -331,6 +331,14 @@ mkdir -p "$CH/var/lib/hifi-player" "$CH/var/log/hifi" "$CH/mnt" "$CH/media"
 # RAUC keyring + version markers outside /etc; NBD for `rauc install https://…`.
 mkdir -p "$CH/etc/rauc" "$CH/usr/lib/osmium" "$CH/etc/modules-load.d"
 install -m 0644 "$KEYRING" "$CH/etc/rauc/keyring.pem"
+# OTA signing public key — baked at /etc/hifi-player/ota-pubkey.pem so the device
+# verifies the .img OTA payload (hifi-os-update.sh) and the VU/anim stores against
+# it. The x86 live-build stages this in build-distro.sh; this debootstrap path must
+# do it here or runtime OTA verification fails with the pubkey missing.
+OTA_PUBKEY="${OTA_PUBKEY:-$SCRIPT_DIR/ota-keys/ota-pubkey.pem}"
+[ -f "$OTA_PUBKEY" ] || die "OTA public key missing: $OTA_PUBKEY"
+mkdir -p "$CH/etc/hifi-player"
+install -m 0644 "$OTA_PUBKEY" "$CH/etc/hifi-player/ota-pubkey.pem"
 printf '# Osmium Sound: RAUC bundle streaming (rauc install https://...)\nnbd\n' \
     > "$CH/etc/modules-load.d/hifi-rauc.conf"
 printf '%s\n' "$VERSION" > "$CH/usr/lib/osmium/IMAGE_VERSION"
