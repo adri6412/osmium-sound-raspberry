@@ -181,9 +181,15 @@ jobs:
               echo "::error::sign=true but RAUC_SIGNING_CERT / RAUC_SIGNING_KEY secrets are not set"
               exit 1
             fi
-            umask 077
-            printf '%s' "$RAUC_SIGNING_CERT" > "$RUNNER_TEMP/rauc-cert.pem"
-            printf '%s' "$RAUC_SIGNING_KEY"  > "$RUNNER_TEMP/rauc-key.pem"
+            # Confine the restrictive umask to just these two temp-file writes.
+            # A global `umask 077` would persist through build-rpi.sh and make apt
+            # create /usr/share/keyrings/raspberrypi-archive-keyring.gpg mode 0600,
+            # which sqv (apt's sandboxed OpenPGP verifier) then cannot read →
+            # "Permission denied" → "repository is not signed". RUNNER_TEMP is
+            # runner-private and both files are rm'd below, so 0600 here is enough.
+            ( umask 077
+              printf '%s' "$RAUC_SIGNING_CERT" > "$RUNNER_TEMP/rauc-cert.pem"
+              printf '%s' "$RAUC_SIGNING_KEY"  > "$RUNNER_TEMP/rauc-key.pem" )
             ARGS+=(--cert "$RUNNER_TEMP/rauc-cert.pem" --key "$RUNNER_TEMP/rauc-key.pem" --keep-rootfs)
           else
             ARGS+=(--no-bundle)
