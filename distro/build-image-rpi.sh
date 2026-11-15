@@ -18,7 +18,9 @@
 #                         per-slot cmdline.txt (root=PARTUUID=… rauc.slot=A|B).
 #   p4 raw   hifi-root-a  slot A: the rootfs.squashfs, block for block.
 #   p5 raw   hifi-root-b  slot B: empty, filled by the first RAUC/OTA update.
-#   p6 ext4  hifi-data    16 MiB seed; the initramfs grows it to fill the card.
+#   p6       hifi-data-grow  16 MiB UNFORMATTED seed; the initramfs grows it to
+#                         fill the card, formats it (LABEL hifi-data), seeds the
+#                         first-run provisioning marker, then renames it hifi-data.
 #
 # The firmware auto-selects kernel8.img on a Pi4 (BCM2711) and kernel_2712.img on
 # a Pi5 (BCM2712), and the matching DTB, so the single image boots both. The RAUC
@@ -108,7 +110,7 @@ size=${BOOT_MIB}MiB, type=$TYPE_FAT,   name="hifi-boot-a", uuid=$UUID_BOOTA
 size=${BOOT_MIB}MiB, type=$TYPE_FAT,   name="hifi-boot-b", uuid=$UUID_BOOTB
 size=${AB_SLOT_B_MIB}MiB, type=$TYPE_LINUX, name="hifi-root-a", uuid=$UUID_ROOTA
 size=${AB_SLOT_B_MIB}MiB, type=$TYPE_LINUX, name="hifi-root-b", uuid=$UUID_ROOTB
-type=$TYPE_LINUX, name="hifi-data", uuid=$UUID_DATA
+type=$TYPE_LINUX, name="hifi-data-grow", uuid=$UUID_DATA
 EOF
 
 # ── 2. attach as a loop device, partitions included ──────────────────────
@@ -180,15 +182,21 @@ sync
 umount "$MNT_FW"
 umount "$MNT_SQ"
 
-# ── 6. data partition (p6 = hifi-data): ext4 seed, grown on first boot ────
-log "formatting the data seed (p6 = hifi-data)"
-mkfs.ext4 -q -L hifi-data -F "$P_DATA" || die "mkfs.ext4 (data) failed"
+# ── 6. data partition (p6 = hifi-data-grow): left UNFORMATTED on purpose ──
+#   The initramfs (scripts/local-premount/hifi-data-grow) acts ONLY on a
+#   partition named "hifi-data-grow": it grows it to fill the card, formats it
+#   ext4 (LABEL hifi-data), seeds /etc/upper/hifi-player/provisioning-pending,
+#   and only then renames it "hifi-data". Formatting it here, or naming it
+#   "hifi-data" up front, makes that script skip it → no grow and no provisioning
+#   marker → the device boots straight to the kiosk. So leave p6 a bare seed.
+log "data seed (p6 = hifi-data-grow): left unformatted; initramfs grows + seeds it on first boot"
+: "$P_DATA"  # referenced for symmetry; intentionally not formatted here
 
 sync
 losetup -d "$LOOP"; LOOP=""
 
 # ── 7. sanity: the GPT partition names, in order ─────────────────────────
 names=$(sfdisk -d "$OUT" | sed -n 's/.*name="\([^"]*\)".*/\1/p' | tr '\n' ',')
-want="hifi-rpifw,hifi-boot-a,hifi-boot-b,hifi-root-a,hifi-root-b,hifi-data,"
+want="hifi-rpifw,hifi-boot-a,hifi-boot-b,hifi-root-a,hifi-root-b,hifi-data-grow,"
 [ "$names" = "$want" ] || die "unexpected GPT layout: $names (want $want)"
 log "DONE ✓  $OUT ($img_ver, ${total_mib} MiB, GPT tryboot A/B)"
