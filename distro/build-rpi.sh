@@ -233,13 +233,21 @@ cp -f "$SCRIPT_DIR"/rpi-boot/* "$CH/usr/local/share/hifi-ab/rpi-boot/"
 log "injecting python daemons → /usr/local/bin"
 BIN_DEST="$CH/usr/local/bin"
 mkdir -p "$BIN_DEST"
-for py in api_server.py vu_meter_daemon.py sources_server.py webui_server.py \
-          hifi_logging.py hifi_backup.py hifi_i18n.py hifi_metadata.py \
-          hifi_tags.py hifi_squeezelite.py hifi_cdrip.py hifi_signal_path.py \
-          hifi_diskguard.py; do
+# The four server entrypoints are explicit; EVERY hifi_*.py library module ships
+# too. api_server.py imports some of them unguarded at import time
+# (import hifi_system_tweaks as stw, …), so a single missing module crash-loops
+# the service and the kiosk shows "API server unavailable". Copying the whole
+# hifi_*.py set via glob — exactly what the x86 includes.chroot carries — keeps
+# this robust against new modules instead of a hand-maintained list that drifts.
+for py in api_server.py vu_meter_daemon.py sources_server.py webui_server.py; do
     [ -f "$REPO_ROOT/$py" ] || { log "  (skip $py — not in repo root)"; continue; }
     cp -f "$REPO_ROOT/$py" "$BIN_DEST/$py"
     sed -i 's/\r$//' "$BIN_DEST/$py"
+done
+for py in "$REPO_ROOT"/hifi_*.py; do
+    [ -f "$py" ] || continue                       # no match → literal glob, skip
+    cp -f "$py" "$BIN_DEST/"
+    sed -i 's/\r$//' "$BIN_DEST/$(basename "$py")"
 done
 chmod 0755 "$BIN_DEST"/*.py 2>/dev/null || true
 
