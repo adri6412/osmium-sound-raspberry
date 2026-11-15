@@ -4,9 +4,6 @@ bootloader=custom
 # Persistent RAUC state lives on /data (the only writable partition; root is a
 # read-only squashfs). /data is mounted by the initramfs before RAUC runs.
 data-directory=/data/rauc
-# bootname of the slot the running system booted, parsed from rauc.slot= on the
-# kernel command line (set per slot in cmdline.txt).
-bootloaders-state=/data/rauc
 
 [keyring]
 path=/etc/rauc/keyring.pem
