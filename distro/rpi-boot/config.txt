@@ -6,7 +6,14 @@
 # (kernel8.img on the Pi 4 / BCM2711, kernel_2712.img on the Pi 5 / BCM2712),
 # so NO explicit `kernel=` line is needed — raspi-firmware names the images
 # exactly as the firmware expects. The initramfs name IS board-specific, so it
-# is set under the [pi4]/[pi5] filters below.
+# is set under the per-board filters below.
+#
+# NOTE: [pi4]/[pi5] match the Model B boards ONLY — they do NOT match the
+# Compute Modules. The Compute Module 4 (BCM2711, same silicon as the Pi 4) and
+# Compute Module 5 (BCM2712, same as the Pi 5) need their own [cm4]/[cm5]
+# sections, or the board-specific `initramfs` line never applies and the module
+# fails to boot. The rootfs and both kernels/DTBs are shared, so only this file
+# differs per board.
 
 arm_64bit=1
 arm_boost=1
@@ -22,8 +29,27 @@ dtoverlay=vc4-kms-v3d
 max_framebuffers=2
 initramfs initramfs8 followkernel
 
+[cm4]
+# Compute Module 4 (BCM2711): identical kernel/initramfs to the Pi 4.
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+initramfs initramfs8 followkernel
+# The CM4 exposes a SINGLE USB 2.0 line and leaves it in peripheral mode by
+# default. On the CM5 IO Board that line is wired only to the USB-C/OTG port
+# (the board's USB-A ports are USB 3.0, which the CM4 cannot drive), so force
+# host mode to use a USB DAC via the USB-C port + a powered hub.
+dtoverlay=dwc2,dr_mode=host
+
 [pi5]
 # Pi 5 (BCM2712 / RP1): the Pi-5 KMS overlay + its initramfs.
+dtoverlay=vc4-kms-v3d-pi5
+max_framebuffers=2
+initramfs initramfs_2712 followkernel
+
+[cm5]
+# Compute Module 5 (BCM2712 / RP1): identical kernel/initramfs to the Pi 5.
+# USB-A on the CM5 IO Board is native USB 3.0 from the module, so no USB overlay
+# is needed here.
 dtoverlay=vc4-kms-v3d-pi5
 max_framebuffers=2
 initramfs initramfs_2712 followkernel
