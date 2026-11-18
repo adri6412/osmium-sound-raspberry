@@ -103,6 +103,11 @@ cleanup() {
 trap cleanup EXIT
 
 # ── 1. the empty disk and its GPT ────────────────────────────────────────
+# The three FAT boot partitions carry GPT attribute bit 2 (LegacyBIOSBootable).
+# The Pi 5 / CM5 EEPROM builds its boot-candidate set from partitions that have
+# this bit; without it the firmware rejects the whole table and loops on
+# "GPT: No bootable partitions", never reading autoboot.txt. This matches
+# rpi-image-gen's working A/B GPT layout (bootable=true on bootconfig+boot_a/b).
 total_mib=$(( 1 + FW_MIB + BOOT_MIB * 2 + AB_SLOT_B_MIB * 2 + DATA_SEED_MIB + 1 ))
 log "disk image: ${total_mib} MiB (fw ${FW_MIB}, boot ${BOOT_MIB}×2, slots ${AB_SLOT_B_MIB}×2, system image $(( img_bytes / 1048576 )) MiB)"
 rm -f "$OUT"
@@ -110,9 +115,9 @@ truncate -s "${total_mib}M" "$OUT"
 sfdisk --quiet "$OUT" <<EOF || die "sfdisk failed"
 label: gpt
 label-id: $DISK_GUID
-size=${FW_MIB}MiB,   type=$TYPE_FAT,   name="hifi-rpifw", uuid=$UUID_RPIFW
-size=${BOOT_MIB}MiB, type=$TYPE_FAT,   name="hifi-boot-a", uuid=$UUID_BOOTA
-size=${BOOT_MIB}MiB, type=$TYPE_FAT,   name="hifi-boot-b", uuid=$UUID_BOOTB
+size=${FW_MIB}MiB,   type=$TYPE_FAT,   name="hifi-rpifw", uuid=$UUID_RPIFW, attrs="LegacyBIOSBootable"
+size=${BOOT_MIB}MiB, type=$TYPE_FAT,   name="hifi-boot-a", uuid=$UUID_BOOTA, attrs="LegacyBIOSBootable"
+size=${BOOT_MIB}MiB, type=$TYPE_FAT,   name="hifi-boot-b", uuid=$UUID_BOOTB, attrs="LegacyBIOSBootable"
 size=${AB_SLOT_B_MIB}MiB, type=$TYPE_LINUX, name="hifi-root-a", uuid=$UUID_ROOTA
 size=${AB_SLOT_B_MIB}MiB, type=$TYPE_LINUX, name="hifi-root-b", uuid=$UUID_ROOTB
 type=$TYPE_LINUX, name="hifi-data-grow", uuid=$UUID_DATA
@@ -204,4 +209,9 @@ losetup -d "$LOOP"; LOOP=""
 names=$(sfdisk -d "$OUT" | sed -n 's/.*name="\([^"]*\)".*/\1/p' | tr '\n' ',')
 want="hifi-rpifw,hifi-boot-a,hifi-boot-b,hifi-root-a,hifi-root-b,hifi-data-grow,"
 [ "$names" = "$want" ] || die "unexpected GPT layout: $names (want $want)"
-log "DONE ✓  $OUT ($img_ver, ${total_mib} MiB, GPT tryboot A/B)"
+# The three FAT boot partitions MUST carry the LegacyBIOSBootable attribute or
+# the Pi 5 / CM5 firmware loops on "GPT: No bootable partitions". Fail loudly
+# here rather than ship another image that silently refuses to boot.
+nboot=$(sfdisk -d "$OUT" | grep -c 'attrs="[^"]*LegacyBIOSBootable')
+[ "$nboot" -eq 3 ] || die "expected 3 LegacyBIOSBootable FAT partitions, found $nboot"
+log "DONE ✓  $OUT ($img_ver, ${total_mib} MiB, GPT tryboot A/B, 3 bootable FATs)"
