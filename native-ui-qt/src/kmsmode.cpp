@@ -202,8 +202,50 @@ QJsonObject kmsPlan(const QList<KmsOutput> &outputs, const QString &resolutionPr
     return root;
 }
 
+// Vero se quel nodo DRM ha almeno un connettore COLLEGATO con dei modi: cioe' e'
+// il controller del display, non un nodo di solo rendering (il V3D). Serve
+// perche' su Pi 5 (BCM2712) l'ordine di /dev/dri/card* non e' stabile e puo'
+// scambiarsi tra un boot e l'altro: card0 puo' essere il render del V3D (zero
+// connettori) e il display stare su card1. Vedi raspberrypi forum: "always
+// query the devices for their rendering capabilities, don't hard code it".
+static bool cardHasConnectedOutput(const QString &path) {
+    int fd = open(path.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = false;
+    drmModeRes *res = drmModeGetResources(fd);
+    if (res) {
+        for (int i = 0; i < res->count_connectors && !ok; i++) {
+            drmModeConnector *c = drmModeGetConnector(fd, res->connectors[i]);
+            if (!c) continue;
+            if (c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) ok = true;
+            drmModeFreeConnector(c);
+        }
+        drmModeFreeResources(res);
+    }
+    close(fd);
+    return ok;
+}
+
+// La card DRM da usare: quella richiesta se ha gia' un'uscita collegata,
+// altrimenti la prima fra /dev/dri/card0..card9 che ne ha una. Se nessuna ne ha
+// (schermo staccato), si torna alla richiesta e ci prova Qt.
+static QString detectDisplayCard(const QString &preferred) {
+    if (cardHasConnectedOutput(preferred)) return preferred;
+    for (int i = 0; i < 10; i++) {
+        const QString p = QStringLiteral("/dev/dri/card%1").arg(i);
+        if (p == preferred) continue;
+        if (cardHasConnectedOutput(p)) {
+            qInfo("kms: display su %s (%s non ha uscite collegate)", qPrintable(p), qPrintable(preferred));
+            return p;
+        }
+    }
+    return preferred;
+}
+
 QString kmsConfigFor(const QString &pref, const QString &screens, const QString &card) {
-    int fd = open(card.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
+    // Non fidarsi di card0 fisso: scegliere il nodo che ha davvero il display.
+    const QString chosen = detectDisplayCard(card);
+    int fd = open(chosen.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
     if (fd < 0) return QString();
     drmModeRes *res = drmModeGetResources(fd);
     if (!res) { close(fd); return QString(); }
@@ -229,8 +271,15 @@ QString kmsConfigFor(const QString &pref, const QString &screens, const QString 
     drmModeFreeResources(res);
     close(fd);
 
-    const QJsonObject plan = kmsPlan(outs, pref, screens, card);
-    if (plan.isEmpty()) return QString();
+    QJsonObject plan = kmsPlan(outs, pref, screens, chosen);
+    if (plan.isEmpty()) {
+        // Nessuna modifica di modo da imporre (risoluzione nativa, un monitor):
+        // ma se la card giusta non e' quella che Qt sceglierebbe da solo, va
+        // comunque fissata, o su Pi 5 eglfs aprirebbe il nodo sbagliato.
+        if (outs.isEmpty()) return QString();
+        plan = QJsonObject();
+        plan["device"] = chosen;
+    }
     QFile f("/tmp/hifi-qt-kms.json");
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return QString();
     const QByteArray json = QJsonDocument(plan).toJson(QJsonDocument::Compact);
