@@ -41,7 +41,12 @@ RPI_BOOT_DIR="$SCRIPT_DIR/rpi-boot"
 ROOTFS=""
 OUT=""
 DATA_SEED_MIB=16
-FW_MIB=32           # p1 selector: autoboot.txt + firmware fallback
+# p1 selector: autoboot.txt + firmware fallback. MUST stay a real FAT32 volume
+# (>= 65525 clusters): below that, mkfs.vfat -F32 still writes the FAT16 BPB and
+# the Pi EEPROM then reads it as FAT16, misses autoboot.txt and loops with
+# "GPT: No bootable partitions" (rpi-eeprom#818). 32 MiB fell under that limit;
+# 64 MiB is safely FAT32.
+FW_MIB=64
 BOOT_MIB=256        # p2/p3 per-slot boot FAT (2 kernels + 2 initramfs + DTBs/overlays)
 
 # Fixed GPT GUIDs so PARTUUIDs are stable across builds (cmdline root=PARTUUID=…).
