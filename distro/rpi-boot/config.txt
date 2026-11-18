@@ -23,15 +23,23 @@ disable_splash=1
 # Serial console on the GPIO header for headless bring-up; free in production.
 enable_uart=1
 
+# CMA is sized HERE (cma-256 on the KMS overlay), NOT via `cma=` on the kernel
+# command line. On the Pi 5 / CM5 (BCM2712) a `cma=` arg bypasses the device
+# tree `linux,cma` node and its `alloc-ranges`, so CMA lands above 1 GB; the
+# VideoCore firmware mailbox can only reach memory below 1 GB, so every mailbox
+# request then fails -> `raspberrypi-clk ... failed -22`, no cpufreq, RP1/PCIe
+# never probe, and the kernel hangs early (raspberrypi/linux#7230). Sizing CMA
+# through the overlay keeps the DT reservation and its <1 GB constraint.
+
 [pi4]
 # Pi 4 (BCM2711): KMS driver + the matching initramfs raspi-firmware produced.
-dtoverlay=vc4-kms-v3d
+dtoverlay=vc4-kms-v3d,cma-256
 max_framebuffers=2
 initramfs initramfs8 followkernel
 
 [cm4]
 # Compute Module 4 (BCM2711): identical kernel/initramfs to the Pi 4.
-dtoverlay=vc4-kms-v3d
+dtoverlay=vc4-kms-v3d,cma-256
 max_framebuffers=2
 initramfs initramfs8 followkernel
 # The CM4 exposes a SINGLE USB 2.0 line and leaves it in peripheral mode by
@@ -41,8 +49,9 @@ initramfs initramfs8 followkernel
 dtoverlay=dwc2,dr_mode=host
 
 [pi5]
-# Pi 5 (BCM2712 / RP1): the Pi-5 KMS overlay + its initramfs.
-dtoverlay=vc4-kms-v3d-pi5
+# Pi 5 (BCM2712 / RP1): the Pi-5 KMS overlay + its initramfs. cma-256 here, not
+# cma= on cmdline (see the note above the [pi4] block).
+dtoverlay=vc4-kms-v3d-pi5,cma-256
 max_framebuffers=2
 initramfs initramfs_2712 followkernel
 
@@ -50,7 +59,7 @@ initramfs initramfs_2712 followkernel
 # Compute Module 5 (BCM2712 / RP1): identical kernel/initramfs to the Pi 5.
 # USB-A on the CM5 IO Board is native USB 3.0 from the module, so no USB overlay
 # is needed here.
-dtoverlay=vc4-kms-v3d-pi5
+dtoverlay=vc4-kms-v3d-pi5,cma-256
 max_framebuffers=2
 initramfs initramfs_2712 followkernel
 
