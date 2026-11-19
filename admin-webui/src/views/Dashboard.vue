@@ -228,6 +228,40 @@ const gpu = computed(() => [
   stats.value.gpu_percent != null ? `${stats.value.gpu_percent}%` : null,
   stats.value.gpu_temp_c != null ? `${stats.value.gpu_temp_c}°C` : null,
 ].filter(Boolean).join(' · '));
+
+// Installed RAM as "8 GB", read from the fixed system info (ram_total_mb),
+// not the live stats. Shown next to the live usage %.
+const ramTotal = computed(() => {
+  const mb = info.value.ram_total_mb;
+  return mb != null ? fmtGb(mb / 1024) : '';
+});
+
+// The links actually in use right now, not the radios the box happens to
+// have: the network interface carrying the connection (Ethernet or Wi-Fi,
+// from network_status) and Bluetooth only while a device is connected to
+// it. Nothing active reads as "—".
+const conn = computed(() => {
+  const i = info.value;
+  if (i.has_wired === undefined) return '';   // info not loaded yet
+  const parts = [];
+  if (net.value.type === 'wired') parts.push(t('dashboard.ethernet'));
+  else if (net.value.type === 'wireless') parts.push(t('dashboard.wifi'));
+  if (i.bt_connected) parts.push(t('dashboard.bluetooth'));
+  return parts.length ? parts.join(' · ') : '—';
+});
+
+// A readable name for a disk row: its model when the drive reports one,
+// else the kernel name (sda, nvme0n1). The bus (SATA/USB/NVMe) and size
+// are shown alongside.
+const TRAN_LABEL = { sata: 'SATA', ata: 'SATA', usb: 'USB', nvme: 'NVMe', mmc: 'eMMC/SD', sas: 'SAS' };
+function diskLine(d) {
+  const name = d.model || d.name;
+  const bus = TRAN_LABEL[d.transport] || (d.transport ? d.transport.toUpperCase() : '');
+  const bits = [fmtGb(d.size_gb)];
+  if (bus) bits.push(bus);
+  if (d.removable) bits.push(t('dashboard.disks.removable'));
+  return { name, detail: bits.join(' · ') };
+}
 </script>
 
 <template>
@@ -240,6 +274,12 @@ const gpu = computed(() => [
     <a class="tile" :href="lmsUrl" target="_blank">
       <span class="t gold">{{ t('dashboard.music') }}</span>
       <span class="muted">{{ t('dashboard.musicDesc') }}</span>
+    </a>
+    <!-- The full-screen Now Playing web view, served by this appliance at /np
+         (same origin and session). A plain link, opened in its own tab. -->
+    <a class="tile" href="np" target="_blank">
+      <span class="t gold">{{ t('dashboard.nowPlaying') }}</span>
+      <span class="muted">{{ t('dashboard.nowPlayingDesc') }}</span>
     </a>
     <RouterLink class="tile" to="/settings">
       <span class="t gold">{{ t('dashboard.settings') }}</span>
@@ -257,17 +297,31 @@ const gpu = computed(() => [
     <div class="between item"><span class="muted">{{ t('dashboard.displayMode') }}</span>
       <span class="silver">{{ mode === 'headless' ? t('dashboard.headless') : mode === 'gui' ? t('dashboard.onscreen') : '—' }}</span>
     </div>
+    <div class="between item"><span class="muted">{{ t('dashboard.connectivity') }}</span>
+      <span class="silver">{{ conn || '—' }}</span>
+    </div>
+    <div class="between item"><span class="muted">{{ t('dashboard.processor') }}</span>
+      <span class="silver cpu-model">{{ info.cpu && info.cpu.model ? info.cpu.model : '—' }}<template v-if="info.cpu && info.cpu.cores"> · {{ t('dashboard.cores', { n: info.cpu.cores }) }}</template></span>
+    </div>
     <div class="between item"><span class="muted">{{ t('dashboard.cpu') }}</span>
       <span class="silver">{{ stats.cpu_percent != null ? stats.cpu_percent + '%' : '—' }}</span>
     </div>
     <div class="between item"><span class="muted">{{ t('dashboard.ram') }}</span>
-      <span class="silver">{{ stats.ram_percent != null ? stats.ram_percent + '%' : '—' }}</span>
+      <span class="silver">{{ stats.ram_percent != null ? stats.ram_percent + '%' : '—' }}<template v-if="ramTotal"> · {{ ramTotal }}</template></span>
     </div>
     <div class="between item"><span class="muted">{{ t('dashboard.temperature') }}</span>
       <span class="silver">{{ stats.temp_c != null ? stats.temp_c + '°C' : '—' }}</span>
     </div>
     <div class="between item" v-if="gpu"><span class="muted">{{ t('dashboard.gpu') }}</span>
       <span class="silver">{{ gpu }}</span>
+    </div>
+  </div>
+
+  <div class="card" v-if="info.disks && info.disks.length">
+    <h3><span class="dot"></span>{{ t('dashboard.disks.title') }}</h3>
+    <div class="between item" v-for="d in info.disks" :key="d.name">
+      <span class="muted dkname">{{ diskLine(d).name }}</span>
+      <span class="silver">{{ diskLine(d).detail }}</span>
     </div>
   </div>
 
@@ -354,3 +408,12 @@ const gpu = computed(() => [
     </div>
   </div>
 </template>
+
+<style scoped>
+/* The CPU model and a disk's model are free-form strings of unknown length.
+   Let the value take the right-hand side, wrap, and stay right-aligned so a
+   long "Intel(R) Core(TM) i5-8250U CPU @ 1.60 GHz" never pushes the label. */
+.cpu-model { text-align: right; }
+.between.item > .silver.cpu-model { min-width: 0; overflow-wrap: anywhere; }
+.between.item > .dkname { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; }
+</style>

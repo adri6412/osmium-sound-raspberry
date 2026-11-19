@@ -20,6 +20,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 import hifi_recommend as rec  # noqa: E402
+from hifi_metadata import HttpError, OfflineError  # noqa: E402
 
 DAY = 86400.0
 
@@ -185,10 +186,10 @@ class RankTestCase(unittest.TestCase):
         free = rec.rank(V, cands, C, [1.0], n=6)
         self.assertEqual({cands[i]['source'] for i, _, _ in free}, {'library'})
         caps = rec.source_caps(cands, n=6)
-        self.assertEqual(caps, {'library': 3})
+        self.assertEqual(caps, {'library': 1})
         got = [cands[i]['source'] for i, _, _ in rec.rank(V, cands, C, [1.0], n=6, source_caps=caps)]
-        self.assertEqual(got.count('library'), 3)
-        self.assertEqual(got.count('tidal'), 3)
+        self.assertEqual(got.count('library'), 1)
+        self.assertEqual(got.count('tidal'), 5)
 
     def test_source_cap_gives_way_when_the_others_run_dry(self):
         C = unit([1, 0])[None, :]
@@ -202,7 +203,7 @@ class RankTestCase(unittest.TestCase):
         lib, q, t = ({'source': s} for s in ('library', 'qobuz', 'tidal'))
         self.assertEqual(rec.source_caps([lib, lib]), {})
         self.assertEqual(rec.source_caps([q, q]), {})
-        self.assertEqual(rec.source_caps([lib, q, t], n=40), {'library': 20, 'qobuz': 10, 'tidal': 10})
+        self.assertEqual(rec.source_caps([lib, q, t], n=40), {'library': 8, 'qobuz': 16, 'tidal': 16})
         self.assertEqual(rec.source_caps([q, t], n=40), {'qobuz': 20, 'tidal': 20})
 
     def test_mmr_prefers_something_different(self):
@@ -279,6 +280,36 @@ class DatabaseTestCase(unittest.TestCase):
         rec.dismiss(self.db, rec.album_key('A', '1'))
         self.assertEqual([r['artist'] for r in rec.read_recommendations(self.db)], ['B'])
         self.assertIn(rec.album_key('a', '1 (Deluxe Edition)'), rec.dismissed_keys(self.db))
+
+    def test_block_artist_removes_now_and_is_remembered(self):
+        rec.write_recommendations(self.db, [self.row('Opeth', 'Blackwater Park'),
+                                            self.row('Opeth', 'Damnation'),
+                                            self.row('Tool', 'Lateralus')])
+        rec.block_artist(self.db, 'Opeth')
+        # every album by the blocked artist is gone at once, others stay
+        self.assertEqual([r['artist'] for r in rec.read_recommendations(self.db)], ['Tool'])
+        # the artist is remembered by its normalized key, with its display name
+        self.assertIn(rec.norm_text('Opeth'), rec.blocked_artist_keys(self.db))
+        self.assertEqual([a['name'] for a in rec.blocked_artist_list(self.db)], ['Opeth'])
+
+    def test_blocked_artist_matches_spelling_variants(self):
+        rec.block_artist(self.db, 'Opeth')
+        self.assertIn(rec.norm_text('OPETH'), rec.blocked_artist_keys(self.db))
+        rec.write_recommendations(self.db, [self.row('opeth', 'Watershed')])
+        # a later recommendation of the same artist (different casing) is pruned
+        rec.block_artist(self.db, 'Opeth')
+        self.assertEqual(rec.read_recommendations(self.db), [])
+
+    def test_unblock_artist_forgets_it(self):
+        rec.block_artist(self.db, 'Opeth')
+        key = rec.norm_text('Opeth')
+        rec.unblock_artist(self.db, key)
+        self.assertNotIn(key, rec.blocked_artist_keys(self.db))
+        self.assertEqual(rec.blocked_artist_list(self.db), [])
+
+    def test_blank_artist_is_never_blocked(self):
+        rec.block_artist(self.db, '   ')
+        self.assertEqual(rec.blocked_artist_keys(self.db), set())
 
     def test_states(self):
         self.assertEqual(rec.history_state(self.db)['state'], 'few_plays')
@@ -362,6 +393,16 @@ class SettingsTestCase(unittest.TestCase):
         self.assertTrue(s['enabled'])
         self.assertEqual(s['schedule'], {'mode': 'daily', 'days': [], 'time': '18:00'})
         self.assertEqual(s['sources'], list(rec.SOURCES))
+        self.assertTrue(s['run_on_boot'])
+
+    def test_run_on_boot_is_kept_and_toggled(self):
+        self.assertFalse(rec.clean_settings({'run_on_boot': False})['run_on_boot'])
+        self.assertFalse(rec.clean_settings({'run_on_boot': 0})['run_on_boot'])
+        cur = rec.clean_settings({})
+        self.assertFalse(rec.merge_settings(cur, {'run_on_boot': False})['run_on_boot'])
+        # an unrelated change leaves it untouched
+        self.assertTrue(rec.merge_settings(rec.clean_settings({'run_on_boot': True}),
+                                           {'enabled': False})['run_on_boot'])
 
     def test_garbage_is_cleaned(self):
         s = rec.clean_settings({'enabled': 0, 'sources': ['tidal', 'napster'],
@@ -461,19 +502,26 @@ class ScreenSettingsTestCase(unittest.TestCase):
 class FakeHttp:
     """hifi_metadata.HttpClient's get_json, answered from canned replies."""
 
-    def __init__(self, known=(), offline=False):
+    def __init__(self, known=(), offline=False, http_fail=(), bytag=()):
         self.known = {rec.norm_text(k): v for k, v in dict(known).items()}
+        # genre/tag -> [artist names] that Last.fm's tag.gettopartists returns
+        self.bytag = {rec.norm_text(k): list(v) for k, v in dict(bytag).items()}
         self.offline = offline
+        # Artist names whose MusicBrainz lookup raises a transient HttpError,
+        # like the real client does on a 503 whose retries are exhausted.
+        self.http_fail = {rec.norm_text(n) for n in http_fail}
         self.urls = []
 
     def get_json(self, url, group='mb', **kw):
         import urllib.parse
         self.urls.append(url)
         if self.offline:
-            raise OSError('no route')
+            raise OfflineError('no route')
         q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
         if group == 'mb':
             name = q['query'][0][len('artist:"'):-1]
+            if rec.norm_text(name) in self.http_fail:
+                raise HttpError(503)
             k = self.known.get(rec.norm_text(name))
             if not k:
                 return {'artists': []}
@@ -489,6 +537,9 @@ class FakeHttp:
                 'infl': {'value': '|'.join(k.get('influences', []))},
                 'd': {'value': k.get('about', '')}}]}}
         if group == 'lastfm':
+            if q['method'][0] == 'tag.gettopartists':
+                return {'topartists': {'artist': [{'name': n}
+                                                  for n in self.bytag.get(rec.norm_text(q['tag'][0]), [])]}}
             k = self.known.get(rec.norm_text(q['artist'][0])) or {}
             if q['method'][0] == 'artist.gettoptags':
                 return {'toptags': {'tag': [{'name': t, 'count': 50} for t in k.get('lfm', [])]}}
@@ -576,6 +627,35 @@ class ProfileTestCase(unittest.TestCase):
         self.assertNotIn('SECRETKEY', ' '.join(Log.lines))
         self.assertEqual(db.execute('SELECT COUNT(*) FROM artist_info').fetchone()[0], 0)
 
+    def test_enrich_skips_transient_http_error_and_continues(self):
+        db = rec.open_db(':memory:')
+        http = FakeHttp(KNOWN, http_fail=['Genesis'])
+        lines = []
+
+        class Log:
+            def info(self, fmt, *a):
+                lines.append(fmt % a)
+        have, n = rec.enrich(db, ['Pink Floyd', 'Genesis', 'Camel'], http, log=Log())
+        # Genesis' 503 is skipped; the others are still enriched, and the
+        # skipped artist stays stale (not written) so the next run retries it.
+        self.assertEqual((sorted(have), n), (['camel', 'pink floyd'], 3))
+        self.assertEqual(db.execute('SELECT COUNT(*) FROM artist_info').fetchone()[0], 2)
+        self.assertEqual(lines, [])                       # a transient error is not a stop
+
+    def test_enrich_stops_after_consecutive_failures(self):
+        db = rec.open_db(':memory:')
+        names = ['Fail%d' % i for i in range(rec.MAX_ENRICH_FAILS + 1)]
+        http = FakeHttp(KNOWN, http_fail=names)
+        lines = []
+
+        class Log:
+            def info(self, fmt, *a):
+                lines.append(fmt % a)
+        have, n = rec.enrich(db, names, http, log=Log())
+        self.assertEqual((have, n), ({}, rec.MAX_ENRICH_FAILS))
+        self.assertIn('recommend: enrichment stopped (HttpError)', lines)
+        self.assertEqual(db.execute('SELECT COUNT(*) FROM artist_info').fetchone()[0], 0)
+
     def test_describe(self):
         p, _ = rec.fetch_profile('Pink Floyd', FakeHttp(KNOWN), key='k')
         text = rec.describe('Pink Floyd', p, genres=['Rock'], year=1977)
@@ -623,6 +703,9 @@ class FakeLyrion:
             return {'albums_loop': [{'id': a[0], 'artist': a[1], 'album': a[2], 'year': 1975,
                                      'artwork_track_id': 'art%s' % a[0]} for a in rows]}
         if cmd[0] == 'pref':
+            if len(cmd) >= 3 and cmd[1] == 'plugin.qobuz:qobuz_recent_search' and cmd[2] != '?':
+                self.qobuz_recent = list(cmd[2])     # set the whole array back
+                return {}
             return {'_p2': list(self.qobuz_recent)}
         if cmd[0] == 'getstring':
             # a token Lyrion does not know comes back as it went in
@@ -693,6 +776,42 @@ class FakeLyrion:
             for i, t in enumerate(self.catalog.get(self.term, []))]}
 
 
+class GenreSeedTestCase(unittest.TestCase):
+    def test_dominant_genres_bring_fresh_artists(self):
+        http = FakeHttp(KNOWN, bytag={'art rock': ['Marillion', 'Yes', 'Camel'],
+                                      'progressive rock': ['Rush', 'Yes']})
+        got = rec.genre_seeds(
+            ['pink floyd'], {'pink floyd': {'genres': ['art rock'], 'tags': ['progressive rock']}},
+            {'pink floyd': 1.0}, http, 'abc', taken={'camel'}, want=3)
+        self.assertNotIn('Camel', got)                 # already owned/seeded: skipped
+        self.assertTrue(set(got) <= {'Marillion', 'Yes', 'Rush'})
+        self.assertIn('Marillion', got)                # round-robin takes one per tag first
+        self.assertLessEqual(len(got), 3)
+
+    def test_no_key_means_no_genre_seeds(self):
+        http = FakeHttp(KNOWN, bytag={'art rock': ['Yes']})
+        got = rec.genre_seeds(['pink floyd'], {'pink floyd': {'genres': ['art rock']}},
+                              {'pink floyd': 1.0}, http, '', taken=set(), want=3)
+        self.assertEqual(got, [])
+
+    def test_transient_tag_error_yields_nothing(self):
+        class Boom(FakeHttp):
+            def get_json(self, url, group='mb', **kw):
+                if group == 'lastfm':
+                    raise HttpError(503)
+                return super().get_json(url, group, **kw)
+        got = rec.genre_seeds(['pink floyd'], {'pink floyd': {'genres': ['art rock']}},
+                              {'pink floyd': 1.0}, Boom(KNOWN), 'abc', taken=set(), want=3)
+        self.assertEqual(got, [])
+
+    def test_offline_tag_lookup_yields_nothing(self):
+        # Best-effort: a dead network must not abort the run here.
+        got = rec.genre_seeds(['pink floyd'], {'pink floyd': {'genres': ['art rock']}},
+                              {'pink floyd': 1.0}, FakeHttp(KNOWN, offline=True),
+                              'abc', taken=set(), want=3)
+        self.assertEqual(got, [])
+
+
 class ServiceSearchTestCase(unittest.TestCase):
     def test_tidal_gives_the_favourite_url(self):
         ly = FakeLyrion([])
@@ -708,13 +827,25 @@ class ServiceSearchTestCase(unittest.TestCase):
                          [('Camel', 'Mirage', 'qobuz://album:q0x.qbz'),
                           ('Camel', 'Moonmadness', 'qobuz://album:q1x.qbz')])
 
-    def test_qobuz_recent_searches_are_left_as_found(self):
+    def test_qobuz_history_restored_after_searches(self):
         ly = FakeLyrion([])
         s = rec.ServiceSearch(ly, 'aa:bb', 'qobuz')
-        s.albums('Camel')
-        self.assertEqual(ly.qobuz_recent, ['halo'])
-        self.assertEqual(s.albums('halo'), [])           # the owner's own term: hands off
-        self.assertEqual(ly.qobuz_recent, ['halo'])
+        self.assertTrue(s.albums('Camel'))               # searches, candidates come back
+        self.assertIn('Camel', ly.qobuz_recent)          # our term lands in the list
+        s.restore()
+        self.assertEqual(ly.qobuz_recent, ['halo'])      # put back exactly as found
+
+    def test_qobuz_full_history_is_not_a_wall(self):
+        # A real Qobuz user is always at the 30-search cap; the old guard made
+        # every search return [] there, killing streaming discovery. Now we
+        # search regardless and restore the list whole.
+        ly = FakeLyrion([])
+        ly.qobuz_recent = ['t%d' % i for i in range(30)]
+        snap = list(ly.qobuz_recent)
+        s = rec.ServiceSearch(ly, 'aa:bb', 'qobuz')
+        self.assertTrue(s.albums('Camel'))               # NOT blocked by the cap
+        s.restore()
+        self.assertEqual(ly.qobuz_recent, snap)          # restored identically
 
     def test_not_signed_in_is_not_usable(self):
         s = rec.ServiceSearch(FakeLyrion([], signed_in=()), 'aa:bb', 'deezer')
@@ -921,6 +1052,20 @@ class RunTestCase(unittest.TestCase):
         self.assertNotIn(rec.album_key('Pink Floyd', 'Animals'), keys)
         self.assertEqual(ly.qobuz_recent, ['halo'])
         self.assertLessEqual(got['searches'], 2 * rec.MAX_SEARCHES_PER_SERVICE)
+
+    def test_genre_seeds_search_beyond_similar_artists(self):
+        # Marillion is in nobody's "similar" list, but shares Pink Floyd's
+        # genre, so the genre seeds must still send it to streaming search.
+        self.listen('Pink Floyd', 'Animals', 30)
+        ly = FakeLyrion(LIBRARY, signed_in=('qobuz',))
+        ly.catalog['Marillion'] = ['Misplaced Childhood']
+        http = FakeHttp(KNOWN, bytag={'art rock': ['Marillion']})
+        got = rec.run(self.db, ly, http=http, now=self.now,
+                      settings={'lastfm_key': 'abc', 'sources': ['qobuz']})
+        self.assertEqual(got['outcome'], 'ok')
+        searched = any('search:Marillion' in [str(x) for x in c[1]] for c in ly.calls)
+        self.assertTrue(searched)                      # reached streaming via genre
+        self.assertEqual(ly.qobuz_recent, ['halo'])    # history still restored
 
     def test_run_bookkeeping(self):
         rid = rec.start_run(self.db, now=time_now())

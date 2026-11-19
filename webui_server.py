@@ -49,13 +49,16 @@ Dev/local flags:
   HIFI_PROVISION_FAKE=1  stub every nmcli call (no real Wi-Fi), for a laptop
 """
 
+import base64
 import json
+import mimetypes
 import os
 import re
 import secrets
 import shutil
 import socket
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
@@ -86,6 +89,39 @@ API_BASE = 'http://127.0.0.1:8000'
 LYRION_BASE = 'http://127.0.0.1:9000'
 SOURCES_BASE = 'http://127.0.0.1:8080'
 
+# The Now Playing-only web build (Qt→WASM, served from this device). Its static
+# files live under NP_DIST; the Qt code fetches the real backends same-origin
+# through the /device/{api,src,lms} proxies below and reads live DAC levels via
+# the /device/vu/stream SSE bridge (to vu_meter_daemon on ws://127.0.0.1:9001).
+NP_DIST = os.environ.get('HIFI_NP_DIST', '/opt/hifi-np')
+VU_WS_HOST = '127.0.0.1'
+VU_WS_PORT = 9001
+
+# The /np page keeps its OWN Now Playing look (VU on/off, VU skin, animation),
+# independent of the kiosk: changing it on the web must NOT change the device
+# screen. These three prefs live here, per-/np, instead of being written through
+# to api_server (whose files /etc/hifi-player/* ARE the kiosk's shared state).
+# On the data partition so the choice survives reboots and A/B image updates.
+NP_VIEW_FILE = os.environ.get('HIFI_NP_VIEW', '/var/lib/hifi-player/np-view.json')
+_NP_VIEW_LOCK = threading.Lock()
+# api path → (scalar key in the GET/POST reply, key in the POST request body)
+_NP_VIEW_FIELDS = {
+    'vu_meter':             ('enabled',   'enable'),
+    'vu_style':             ('style',     'style'),
+    'nowplaying_animation': ('animation', 'animation'),
+}
+# VU meter skins the user downloaded from the store live here (api_server's
+# VU_STORE_DIR). The /np page bundles only the built-in skins in its WASM pack,
+# so it pulls these over /device/vu-skins into its in-memory file system where
+# VuPanel.qml already reads them (Sys.vuStore → this same default path).
+VU_STORE_DIR = os.environ.get('HIFI_VU_STORE_DIR', '/var/lib/hifi-player/vu-skins')
+_VU_SKIN_ID_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,40}$')
+_VU_SKIN_FILE_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*\.(png|jpg|json)$')
+
+# A manifest file needs its own type for the browser to accept it (the stdlib
+# does not know .webmanifest), so /np/manifest.webmanifest serves correctly.
+mimetypes.add_type('application/manifest+json', '.webmanifest')
+
 AP_CON_NAME = 'hifi-setup'
 AP_ADDR = '10.42.0.1'
 # The setup hotspot is deliberately open (no PSK) -- see SECURITY.md. It used
@@ -114,7 +150,7 @@ _BODY_LIMIT = 1024 * 1024
 # 1.25 GiB: the downloaded-information archive can be large).
 _UPLOAD_BODY_LIMIT = 2 * 1024 * 1024 * 1024
 _UPLOAD_PATHS = ('/api/system/restore', '/api/provision/restore', '/api/system/dsp_fir',
-                 '/api/restore', '/api/dsp/fir')
+                 '/api/restore', '/api/dsp/fir', '/api/system/drivers/install')
 app.config['MAX_CONTENT_LENGTH'] = _BODY_LIMIT
 
 
@@ -1368,7 +1404,7 @@ def _guard():
     # setup page. Outside an AP window there is no Host gate: the appliance
     # is meant to be reachable under any hostname/IP (custom mDNS name,
     # Tailscale, LAN IP, ...), and mutations are already protected
-    # independently of Host by CSRF + the host-only, SameSite=Strict session
+    # independently of Host by CSRF + the host-only, SameSite=Lax session
     # cookie (see _set_csrf_cookie/_bootstrap below) -- a spoofed Host header
     # alone can't forge either. The only unauthenticated reads reachable here
     # are /api/auth/status's two booleans and /api/netrecovery/status, which
@@ -1395,10 +1431,21 @@ def _guard():
     #   * forwarded sources paths — authenticated by the pairing bearer token
     #     (not cookies), so they're CSRF-immune by construction; requiring our
     #     cookie-bound header would just break the embedded :8080 SPA.
+    #   * /device/* — the Now Playing web build's backend proxies. The Qt/WASM
+    #     client has no way to echo our double-submit cookie in a header, and it
+    #     doesn't need to: these routes require the admin session, whose cookie
+    #     is host-only + SameSite=Lax. Lax withholds the cookie on cross-site
+    #     subresource and fetch/XHR requests and on cross-site POST — the only
+    #     ways a cross-site page could *drive* these proxies — so such a request
+    #     still arrives session-less → _require_session 401s it. (Lax does send
+    #     the cookie on a cross-site top-level GET navigation, but that only
+    #     opens one of these routes as a document the other origin cannot read,
+    #     and they return/accept non-sensitive per-/np view state anyway.)
     if request.method in ('POST', 'PUT', 'DELETE', 'PATCH') \
             and request.remote_addr not in ('127.0.0.1', '::1') \
             and not request.path.startswith('/api/provision/') \
             and not request.path.startswith('/api/netrecovery/') \
+            and not request.path.startswith('/device/') \
             and not any(request.path == p or request.path.startswith(p + '/')
                         for p in _SOURCES_FWD_PREFIXES):
         cookie = request.cookies.get('csrf')
@@ -1413,7 +1460,7 @@ def _frame_ancestors():
     # carries an "Osmium Admin" entry that opens this admin in an iframe (see
     # the actions.json asset in distro/.../hifi-lms-skin). A different port is a
     # different *origin* — so it must be named here — but the same *site*, which
-    # is why the SameSite=Strict session cookie still travels into that frame.
+    # is why the SameSite=Lax session cookie still travels into that frame.
     host = request.host
     host = host[:host.index(']') + 1] if host.startswith('[') and ']' in host \
         else host.split(':')[0]
@@ -2447,6 +2494,49 @@ def dsp_fir_proxy():
     return _forward_to_sources('/api/dsp/fir')
 
 
+# ── Driver packs (.osmpack) — session-gated, forwarded raw to sources ──
+# Developer-signed firmware/kernel-module packs the user installs from a USB
+# stick or a web upload. Like dsp_fir, these live on sources_server (:8080) and
+# are reached from OUR authenticated Settings/Setup page, so the webui session
+# is the gate; the install upload (multipart, a .osmpack + its .sig) is relayed
+# raw. The signature is verified on sources' side, inside hifi-driverpack.sh.
+# During first-boot provisioning there is no account yet, but the captive
+# setup page has a driver step (a laptop may be missing the very Wi-Fi/firmware
+# needed to go on), so the gate is relaxed exactly while _provisioning() holds —
+# same pattern as the audio/lyrion steps. Once configured, the session is the
+# gate again. The signature is still verified on sources' side.
+@app.route('/api/system/drivers/usb/scan', methods=['POST'])
+def drivers_usb_scan_proxy():
+    denied = None if _provisioning() else _require_session()
+    if denied:
+        return denied
+    return _forward_to_sources('/api/drivers/usb/scan')
+
+
+@app.route('/api/system/drivers/install', methods=['POST'])
+def drivers_install_proxy():
+    denied = None if _provisioning() else _require_session()
+    if denied:
+        return denied
+    return _forward_to_sources('/api/drivers/install')
+
+
+@app.route('/api/system/drivers/status', methods=['GET'])
+def drivers_status_proxy():
+    denied = None if _provisioning() else _require_session()
+    if denied:
+        return denied
+    return _forward_to_sources('/api/drivers/status')
+
+
+@app.route('/api/system/drivers/list', methods=['GET'])
+def drivers_list_proxy():
+    denied = None if _provisioning() else _require_session()
+    if denied:
+        return denied
+    return _forward_to_sources('/api/drivers/list')
+
+
 # ── LMS skin (Osmium / Material) — session-gated forward to sources_server ──
 # Same story as the FIR filter above: the skin logic lives on sources_server
 # (:8080, owns all Lyrion file ops), reached from OUR authenticated Settings
@@ -2810,6 +2900,285 @@ def _serve_spa(subpath):
     return Response(FALLBACK_HTML, mimetype='text/html')
 
 
+# ── Now Playing web build (Qt→WASM): backend proxies + VU bridge + serving ────
+# The /np page runs the real kiosk's Now Playing in the browser. Unlike the
+# public demo (which mocks /device/* in JS), here these are REAL same-origin
+# proxies to the device's own services, and the VU meters read the live DAC
+# levels off vu_meter_daemon. Everything is behind the admin session.
+_DEVICE_PROXY_BASES = {
+    'api': lambda: API_BASE,       # api_server  (:8000)
+    'src': lambda: SOURCES_BASE,   # sources_server (:8080)
+    'lms': _lyrion_base,           # the Lyrion this device actually plays from
+}
+
+
+def _np_view_load():
+    """The /np page's own VU/animation choices ({} when none made yet)."""
+    try:
+        with open(NP_VIEW_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _np_view_pref(name):
+    """Serve one of the three look prefs for the /np page WITHOUT touching the
+    kiosk. GET forwards to api_server only to pick up the live skin/animation
+    catalogue, then overrides the selected value with the /np one; POST stores
+    the /np choice here and never reaches api_server."""
+    key, body_key = _NP_VIEW_FIELDS[name]
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        value = data.get(body_key)
+        if name == 'vu_meter':
+            value = bool(value)
+        else:
+            value = str(value or '').strip()
+            if not value:
+                return jsonify({'success': False, 'message': 'empty value'}), 400
+        with _NP_VIEW_LOCK:
+            d = _np_view_load()
+            d[name] = value
+            try:
+                os.makedirs(os.path.dirname(NP_VIEW_FILE), exist_ok=True)
+                tmp = NP_VIEW_FILE + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(d, f)
+                os.replace(tmp, NP_VIEW_FILE)
+            except Exception as e:
+                print(f'[webui] np-view persist failed: {e}')
+                return jsonify({'success': False, 'message': 'save failed'}), 500
+        return jsonify({'success': True, key: value})
+    # GET: read the live catalogue from api_server (styles / choices / store),
+    # then present the /np page's own selection in place of the kiosk's.
+    payload = {}
+    try:
+        req = urllib.request.Request(API_BASE + '/' + name, method='GET')
+        for h in ('Authorization', 'X-UI-Lang', 'Accept-Language'):
+            v = request.headers.get(h)
+            if v:
+                req.add_header(h, v)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            payload = json.loads(r.read().decode('utf-8'))
+    except Exception as e:
+        print(f'[webui] np-view api GET {name} failed: {e}')
+    if not isinstance(payload, dict):
+        payload = {}
+    override = _np_view_load().get(name)
+    if override is not None:
+        payload[key] = override
+    return jsonify(payload)
+
+
+@app.route('/device/<svc>/<path:rest>', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def device_proxy(svc, rest):
+    """Transparent, session-gated reverse proxy for the NP web build. Streams
+    the raw response back (JSON, or binary like Lyrion cover art)."""
+    denied = _require_session()
+    if denied:
+        return denied
+    # The look prefs are the /np page's own, never the kiosk's: serve them from
+    # the per-/np store instead of forwarding to api_server (see _np_view_pref).
+    if svc == 'api' and rest in _NP_VIEW_FIELDS:
+        return _np_view_pref(rest)
+    base = _DEVICE_PROXY_BASES.get(svc)
+    if base is None:
+        return jsonify({'success': False, 'message': 'unknown device service'}), 404
+    # Lyrion's cometd long-poll holds the request open (~60 s) waiting for the
+    # next player event, so give /device/lms room; api/src answer promptly.
+    timeout = 120 if svc == 'lms' else 30
+    return _forward_to(base(), '/' + rest, timeout=timeout, service_label=f'device/{svc}')
+
+
+# ── VU bridge: vu_meter_daemon WebSocket (:9001) → SSE ────────────────────────
+# werkzeug's WSGI server can't upgrade a Flask view to a WebSocket, so the
+# browser reads the meters over Server-Sent Events instead and this daemon is
+# the WebSocket *client* of vu_meter_daemon. The client side is a small raw
+# RFC6455 reader (stdlib only — no `websockets` dependency in this process):
+# the daemon only ever sends us small one-line JSON text frames.
+def _vu_ws_send(sock, opcode, payload=b''):
+    """Send one masked client frame (client→server frames MUST be masked)."""
+    mask = os.urandom(4)
+    body = bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
+    n = len(payload)
+    header = bytes([0x80 | opcode])
+    if n < 126:
+        header += bytes([0x80 | n])
+    elif n < 65536:
+        header += bytes([0x80 | 126]) + struct.pack('>H', n)
+    else:
+        header += bytes([0x80 | 127]) + struct.pack('>Q', n)
+    sock.sendall(header + mask + body)
+
+
+def _vu_ws_connect(timeout=5):
+    """Open a raw RFC6455 connection to vu_meter_daemon; return (sock, leftover)
+    once the 101 handshake is done (leftover = any frame bytes read early)."""
+    sock = socket.create_connection((VU_WS_HOST, VU_WS_PORT), timeout=timeout)
+    sock.settimeout(timeout)
+    key = base64.b64encode(os.urandom(16)).decode('ascii')
+    sock.sendall((
+        'GET / HTTP/1.1\r\n'
+        f'Host: {VU_WS_HOST}:{VU_WS_PORT}\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        f'Sec-WebSocket-Key: {key}\r\n'
+        'Sec-WebSocket-Version: 13\r\n\r\n'
+    ).encode('ascii'))
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        chunk = sock.recv(1024)
+        if not chunk:
+            raise ConnectionError('vu daemon closed during handshake')
+        buf += chunk
+        if len(buf) > 16384:
+            raise ConnectionError('vu daemon handshake too large')
+    if b' 101 ' not in buf.split(b'\r\n', 1)[0]:
+        raise ConnectionError('vu daemon refused the upgrade')
+    return sock, buf.split(b'\r\n\r\n', 1)[1]
+
+
+def _vu_ws_frames(sock, leftover=b''):
+    """Yield decoded text payloads (str) from a connected WS socket, answering
+    pings and keeping the stream alive. Raises on close/EOF."""
+    buf = bytearray(leftover)
+
+    def need(n):
+        while len(buf) < n:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError('vu daemon closed')
+            buf.extend(chunk)
+
+    while True:
+        need(2)
+        b0, b1 = buf[0], buf[1]
+        opcode = b0 & 0x0f
+        masked = b1 & 0x80          # server→client is never masked; handle anyway
+        length = b1 & 0x7f
+        hdr = 2
+        if length == 126:
+            need(4); length = struct.unpack('>H', bytes(buf[2:4]))[0]; hdr = 4
+        elif length == 127:
+            need(10); length = struct.unpack('>Q', bytes(buf[2:10]))[0]; hdr = 10
+        mask = b''
+        if masked:
+            need(hdr + 4); mask = bytes(buf[hdr:hdr + 4]); hdr += 4
+        need(hdr + length)
+        payload = bytes(buf[hdr:hdr + length])
+        del buf[:hdr + length]
+        if masked:
+            payload = bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
+        if opcode == 0x8:           # close
+            raise ConnectionError('vu daemon sent close')
+        if opcode == 0x9:           # ping → pong
+            _vu_ws_send(sock, 0xA, payload)
+            continue
+        if opcode == 0xA:           # pong
+            continue
+        if opcode in (0x0, 0x1):    # continuation / text (frames here are small+single)
+            try:
+                yield payload.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+
+
+@app.route('/device/vu/stream', methods=['GET'])
+def device_vu_stream():
+    denied = _require_session()
+    if denied:
+        return denied
+
+    def events():
+        sock = None
+        try:
+            sock, leftover = _vu_ws_connect()
+        except Exception as e:
+            print(f'[webui] vu bridge connect failed: {e}')
+            yield 'event: error\ndata: {"active":false}\n\n'
+            return
+        sock.settimeout(30)         # a frame at least every ~1 s, so 30 s = dead
+        try:
+            for msg in _vu_ws_frames(sock, leftover):
+                yield 'data: ' + msg + '\n\n'
+        except (ConnectionError, OSError) as e:
+            print(f'[webui] vu bridge ended: {e}')
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    resp = Response(events(), mimetype='text/event-stream')
+    resp.headers['Cache-Control'] = 'no-cache, no-transform'
+    resp.headers['X-Accel-Buffering'] = 'no'
+    return resp
+
+
+# ── store VU skins for the /np page ──────────────────────────────────────────
+# The web Now Playing bundles only the built-in skins, so it fetches the store
+# ones (their files) from here and writes them into its WASM file system before
+# Qt starts; VuPanel.qml then draws them with no change.
+@app.route('/device/vu-skins', methods=['GET'])
+def device_vu_skins_manifest():
+    denied = _require_session()
+    if denied:
+        return denied
+    out = {}
+    try:
+        for sid in sorted(os.listdir(VU_STORE_DIR)):
+            if not _VU_SKIN_ID_RE.match(sid):
+                continue
+            d = os.path.join(VU_STORE_DIR, sid)
+            if not os.path.isdir(d) or not os.path.isfile(os.path.join(d, 'skin.json')):
+                continue
+            files = sorted(f for f in os.listdir(d)
+                           if _VU_SKIN_FILE_RE.match(f) and os.path.isfile(os.path.join(d, f)))
+            if files:
+                out[sid] = files
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[webui] vu-skins manifest failed: {e}')
+    return jsonify(out)
+
+
+@app.route('/device/vu-skins/<sid>/<fname>', methods=['GET'])
+def device_vu_skin_file(sid, fname):
+    denied = _require_session()
+    if denied:
+        return denied
+    if not _VU_SKIN_ID_RE.match(sid) or not _VU_SKIN_FILE_RE.match(fname):
+        return jsonify({'success': False, 'message': 'bad skin path'}), 404
+    d = os.path.join(VU_STORE_DIR, sid)
+    if not os.path.isfile(os.path.join(d, fname)):
+        return jsonify({'success': False, 'message': 'not found'}), 404
+    return send_from_directory(d, fname)
+
+
+@app.route('/np', methods=['GET'])
+@app.route('/np/', methods=['GET'])
+@app.route('/np/<path:subpath>', methods=['GET'])
+def np_page(subpath='index.html'):
+    """Serve the Now Playing web build from NP_DIST, session-gated. Any unknown
+    path falls back to index.html so the WASM loader's own routing works."""
+    denied = _require_session()
+    if denied:
+        return denied
+    if not subpath or subpath.endswith('/'):
+        subpath = 'index.html'
+    root = os.path.normpath(NP_DIST)
+    full = os.path.normpath(os.path.join(root, subpath))
+    if full.startswith(root + os.sep) and os.path.isfile(full):
+        return send_from_directory(NP_DIST, subpath)
+    index = os.path.join(NP_DIST, 'index.html')
+    if os.path.isfile(index):
+        return send_from_directory(NP_DIST, 'index.html')
+    return jsonify({'success': False,
+                    'message': 'Now Playing web build not installed'}), 404
+
+
 # Shared CSS for both captive templates below.
 _CAPTIVE_CSS = """
  body{font-family:system-ui,sans-serif;background:#0f1115;color:#eee;margin:0;padding:24px;max-width:520px;margin:auto}
@@ -3103,7 +3472,16 @@ SETUP_CAPTIVE_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-
  <button class="sec" id="btn-remote-pick" onclick="remotePick()">Use this one</button>
  <p class="muted" id="remote-msg"></p>
  <p class="muted" id="remote-later"></p>
- <button id="btn-remote-done" onclick="showFinishScreen()">Continue</button>
+ <button id="btn-remote-done" onclick="show('step-drivers')">Continue</button>
+</div>
+
+<div class="card" id="step-drivers" style="display:none">
+ <label id="lbl-drivers">Missing a driver?</label>
+ <p class="muted" id="drivers-intro"></p>
+ <button class="sec" id="btn-drivers-scan" onclick="driversScan()">Search the USB stick</button>
+ <div id="drivers-found"></div>
+ <p class="muted" id="drivers-msg"></p>
+ <button id="btn-drivers-skip" onclick="showFinishScreen()">Skip</button>
 </div>
 
 <div class="card" id="step-finish" style="display:none">
@@ -3156,8 +3534,8 @@ SETUP_CAPTIVE_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-
 
 <script>
 var STRINGS={
- en:{restoreIntro:'Setting up a new device? Restore a previous backup, or start fresh.',fresh:'Start fresh',restoreFile:'Backup file',restorePass:'Backup password',restore:'Restore from backup',restoring:'Restoring…',restoreOverlayTitle:'Restoring from backup…',restoreDone:'Restore complete. Rebooting to apply it — reconnect in about a minute.',restoreFailed:'Restore failed.',restoreNoFile:'Choose a backup file first.',wifi:'Wi-Fi network',ssid:'Or enter the network name (SSID)',pass:'Wi-Fi password',connect:'Connect via Wi-Fi',wired:"I'm connected via cable (Ethernet)",connecting:'Connecting… the setup Wi-Fi will turn off. Reconnect your phone to your home network, then open http://hifiplayer.local to continue setup where you left off.',noCable:'No cable detected',netIntro:'Connect this device to your home network so it can finish setting up and be reachable from your phone/PC afterwards.',stepLabel:'Step {n} of {total}',audioIntro:'Pick the DAC / output device this player should send audio to. You can change this later from Settings.',lyrionIntro:'Choose where your music library lives: on this device, or on a Lyrion server you already run elsewhere on your network.',timezoneIntro:'Used for the clock, alarms and any scheduled tasks on this device.',updateRequired:'Update required',updateNow:'Update now',updateChecking:'Checking for updates…',updateAutoStarting:'An update is available and required — starting it now…',updateApplying:'Updating — this can take a few minutes…',updateDoneRebooting:'Update complete. Rebooting…',updateFailed:'Update check/install failed. Retrying is required to continue setup.',devname:'Name this player',devnameHelp:'Used as its network name (e.g. "livingroom" → livingroom.local) and its Bluetooth/multiroom name. Letters, numbers and dashes only — leave empty to keep the default.',devnameSaving:'Saving…',mode:'Device mode',modeGui:'With screen (touchscreen)',modeHeadless:'Headless (no screen)',modeOff:'Server only (player off)',modeHelp:'In headless/server-only you manage everything from this web interface.',pointer:'Mouse pointer',pointerHelp:"Show the mouse cursor on screen? Leave it off for a touchscreen — turn it on if you're driving this device with a mouse.",pointerHide:'Touchscreen (hide pointer)',pointerShow:'Mouse (show pointer)',audio:'Audio output',audioContinue:'Continue',lyrion:'Music server (Lyrion)',lyrionLocal:'Use this device as the server',lyrionFollow:'Use a server already on my network',lyrionHost:'Server address',lyrionUse:'Use this server',lyrionInstall:'Install Lyrion',lyrionChecking:'Checking whether Lyrion Music Server is installed…',lyrionMissing:"Lyrion Music Server isn't installed yet.",lyrionInstalling:'Installing Lyrion Music Server…',lyrionUnpacking:'Installing Lyrion Music Server… On a USB stick this step can take several minutes.',lyrionDownloading:'Downloading Lyrion Music Server…',lyrionRestarting:'Restarting Lyrion Music Server…',lyrionInstallFailed:'Lyrion install failed.',continueAnyway:'Continue anyway',skinTitle:'Web player look',skinHelp:"Choose the look of Lyrion's web player (the page you open from a browser or phone). Osmium matches this device's interface.",skinOsmium:'Osmium (recommended)',skinMaterial:'Material',skinInstalling:'Installing the Material web interface…',skinApplying:'Applying the skin…',skinDone:'Skin applied.',skinFailed:"Couldn't apply the skin. Check the network connection and try again.",lmsPlugins:'Music services',lmsPluginsHelp:'Choose what to add to your music server. You can add or remove these later from Lyrion.',lmsPluginsGo:'Install and continue',lmsPluginsSkip:'Skip, add nothing',nextBtn:'Next',plgPageOf:'Page {n} of {total}',plgLater:'You can add or remove these later from Lyrion.',grp_streaming:'Streaming services',grpd_streaming:'Do you have a subscription? Tick the services you want to listen to on this device.',grp_radio:'Internet radio',grpd_radio:'Extras for listening to radio stations over the internet.',grp_info:'About your music',grpd_info:'More details on artists and albums while you listen.',analyticsTick:'Send anonymous usage statistics',lmsPluginsInstalling:'Installing the selected services…',lmsPluginsApplying:'Finishing the music server setup…',lmsPluginsDone:'Music server ready.',lmsPluginsFailed:"Couldn't finish the music server setup.",plg_MusicArtistInfo:'Artist and album info',plgd_MusicArtistInfo:'Biographies, album reviews and lyrics inside the player.',plg_Spotty:'Spotify',plgd_Spotty:'Play your Spotify Premium account through this player.',plg_TIDAL:'TIDAL',plgd_TIDAL:'Listen with your TIDAL subscription.',plg_Qobuz:'Qobuz',plgd_Qobuz:'Listen with your Qobuz subscription.',plg_Deezer:'Deezer',plgd_Deezer:'Listen with your Deezer subscription.',plg_RadioNowPlaying:'Radio track info',plgd_RadioNowPlaying:'Shows the track and cover art playing on internet radio.',plg_RadioNet:'Radio.net',plgd_RadioNet:'Browse the Radio.net internet radio directory.',analytics:'Help improve Lyrion (optional)',analyticsHelp:'Every couple of days, sends an anonymous ID, the version and operating system, the list of active plugins and how many tracks and players you have to the Lyrion community (stats.lms-community.org). No personal data, no track titles. You can change this later from Lyrion.',sources:'Music sources',sourcesAskIntro:'Do you want to set up sources like a NAS or an internal hard disk? External devices (USB) already mount automatically — nothing to do for those.',sourcesYes:'Yes, set up sources',sourcesNo:'No, skip this',sourcesTypeIntro:'Choose what to add. You can add more than one before continuing.',addNas:'Network drive (NAS)',addInternal:'Internal disk',sourcesDone:'Done, continue',sourcesFinishing:'Finishing…',backBtn:'Back',cancelBtn:'Cancel',smbWizIntro:"Music kept on a NAS or another computer. The player looks for them on your network; you only have to pick one.",smbSearching:'Looking for devices on your network',smbNothing:'Nothing found. Check that the other device is switched on and on the same network, or type its address yourself.',smbSearchAgain:'Search again',smbTypeIt:"I'll type it myself",smbAddress:'Name or address of the device',smbManualHint:'For example nas.local or 192.168.1.20.',smbOnDevice:'On {device}',smbAuthHint:'This device wants to know who you are. Use the same username and password you use on it.',smbSignIn:'Sign in',smbSignInTo:'Sign in to {device}',smbUserLabel:'Username',smbWrongPassword:'Wrong username or password. Try again.',smbChangeUser:'Change',smbLoadingShares:'Reading the shared folders…',smbShareLabel:'Shared folder name',smbTypeShareHint:'Type it exactly as it appears on the other device.',smbNoShares:'This device is not sharing any folder.',smbNeedPassword:'It asks for a password',smbDevice:'Device',smbFolder:'Folder',smbAllowWrite:'Let the player write into this folder',smbWriteHint:'Lets the player save into it — needed to copy CDs onto it. Turn it off if the folder only has to be listened to.',smbAddNow:'Add this folder',smbListFailed:'Could not read the shared folders from this device.',smbOpenFailed:'Could not open this folder.',smbShowDetail:'Technical details',smbNoClientHint:'This player cannot read the list of shared folders yet: update it and it will offer them next time.',smbConnecting:'Connecting…',smbConnected:'Connected!',smbFolderTitle:'Choose what to add',smbFolderIntro:'Use the whole share, or open a folder to use just part of it.',smbFolderUp:'Up',smbFolderUse:'Use this folder',smbFolderNoSubfolders:'No subfolders here.',smbFolderSaving:'Saving…',internalIntro:'Pick a disk to use for your music library.',internalLoading:'Loading…',internalNone:'No internal disks found.',internalAlreadyUsed:'Already in use',internalUseBtn:'Use this disk',internalFormatBtn:'Format this disk',internalAdopting:'Adding…',formatTitle:'Format disk',formatFs:'Filesystem',formatLabel:'Disk name',formatWarn:'This will ERASE ALL DATA on {disk}.',formatConfirmMsg:'Type {label} below to confirm.',formatGo:'Format now',formatting:'Formatting — this can take a while…',formatDoneMsg:'Done — the disk is ready to use.',continueBtn:'Continue',timezone:'Time zone',tzSave:'Save and continue',account:'Web admin account',accountHelp:"Used to log into this device's web interface (http://…) from now on.",username:'Username',password:'Password',confirmPassword:'Confirm password',createAccount:'Create account',creating:'Creating…',accountMismatch:'Passwords do not match.',accountTooShort:'Username needs at least 3 characters, password at least 8.',finishGui:'Screen mode set. Setup is complete — press "Complete setup" below: the hotspot will turn off, reconnect your phone to your network. The device will then start its normal on-screen interface.',finishHeadless:'Headless mode set. Press "Complete setup" below: the hotspot will turn off, reconnect your phone to your network and open http://hifiplayer.local',finishOff:'Server-only mode set — this device will not play audio locally. Press "Complete setup" below: the hotspot will turn off, reconnect your phone to your network and open http://hifiplayer.local',finishBtn:'Complete setup',finishDone:'Setup complete — hotspot off. Open http://hifiplayer.local from your network.',finishToLyrion:'Setup complete. Opening the web player…',rebootTitle:'Rebooting…',rebootGoingDown:'The device is restarting.',rebootComingBack:'Waiting for the device to come back online.',rebootAuto:'This page will reconnect automatically — no need to refresh.',remoteTitle:'Do you want to set up a remote control?',remoteIntro:'A remote works the whole on-screen interface. A USB one works the moment you plug its receiver in; a Bluetooth one can be paired right here.',remoteNone:'No remote connected yet.',remoteViaUsb:'USB',remoteViaBluetooth:'Bluetooth',remoteViaOther:'Connected',remoteBtHint:'Bluetooth: put the remote in pairing mode — usually holding a key until its light blinks — then scan and tap it in the list.',remoteScan:'Scan',remoteSearching:'Scanning…',remotePairing:'Pairing…',remotePaired:'Paired.',remoteWaiting:'Paired. Waiting for this device to connect it…',remoteReady:'Ready — it is picked below; press "Use this one".',remoteNotYet:'Paired, but it has not turned up yet. Press a key on the remote to wake it, then scan again.',remoteNothing:'Nothing found. Put the remote in pairing mode and scan again.',remoteFailed:'Could not pair with this remote.',remoteNoBt:'Bluetooth is not available on this device yet: only a USB remote can be used.',remoteAskFailed:'Could not ask this device about its remotes. Try again in a moment.',remoteNeedsUpdate:"This device's system is not new enough to pair a Bluetooth remote. Install the latest update and look again.",remotePick:'Remote to use',remotePickNone:'— none —',remotePickEmpty:'— no remote connected —',remoteUse:'Use this one',remoteUsing:'Done: this remote now drives the interface.',remoteUnset:'No remote in use.',remotePickFailed:'Could not set this remote.',remoteLater:'You can skip this and do it later from Settings → Remote control.',remoteWhich:'Which remote do you have?',remoteOther:'Another remote',remoteHow_firetv:'Hold the Home key (⌂) until the light at the top blinks.',remoteHow_xiaomi:'Hold the ⋮⋮⋮ key and the ○ key together for 7–8 seconds, until the light blinks.',remoteHow_g20s:'Hold OK and Back together for 5–7 seconds, until the light blinks.',remoteCertWait:'Then leave it near the device: it is found and connected by itself.',remoteCertLooking:'Looking for your {name}…',remoteCertPaired:'{name} connected!',remoteCertNotYet:'Not found yet. Check that its light is blinking, then try again.',remoteRetry:'Try again',remoteChangeModel:'Another remote',rmiTitle:'Your {name} remote is ready',rmiBody:'This is what each key does on Osmium.',rmiLater:'You can see it again any time from Settings → Remote control.',rmiGotIt:'Got it',error:'Error: '},
- it:{restoreIntro:'Stai configurando un nuovo dispositivo? Ripristina un backup precedente, oppure inizia da zero.',fresh:'Inizia da zero',restoreFile:'File di backup',restorePass:'Password del backup',restore:'Ripristina da backup',restoring:'Ripristino in corso…',restoreOverlayTitle:'Ripristino da backup in corso…',restoreDone:'Ripristino completato. Riavvio in corso per applicarlo — riconnettiti tra circa un minuto.',restoreFailed:'Ripristino non riuscito.',restoreNoFile:'Scegli prima un file di backup.',wifi:'Rete Wi-Fi',ssid:'Oppure inserisci il nome (SSID)',pass:'Password Wi-Fi',connect:'Connetti via Wi-Fi',wired:'Sono connesso via cavo (Ethernet)',connecting:'Connessione in corso… il Wi-Fi di setup si spegnerà. Riconnetti il telefono alla tua rete di casa, poi apri http://hifiplayer.local per continuare la configurazione da dove l\\'hai lasciata.',noCable:'Nessun cavo rilevato',netIntro:'Collega questo dispositivo alla tua rete di casa così può completare la configurazione ed essere raggiungibile da telefono/PC in seguito.',stepLabel:'Passo {n} di {total}',audioIntro:'Scegli il DAC / dispositivo di uscita a cui questo player deve inviare l\\'audio. Puoi cambiarlo in seguito dalle Impostazioni.',lyrionIntro:'Scegli dove vive la tua libreria musicale: su questo dispositivo, oppure su un server Lyrion che hai già altrove sulla tua rete.',timezoneIntro:'Usato per l\\'orologio, le sveglie e qualsiasi attività pianificata su questo dispositivo.',updateRequired:'Aggiornamento richiesto',updateNow:'Aggiorna ora',updateChecking:'Controllo aggiornamenti…',updateAutoStarting:'È disponibile un aggiornamento obbligatorio — avvio in corso…',updateApplying:'Aggiornamento in corso — può richiedere qualche minuto…',updateDoneRebooting:'Aggiornamento completato. Riavvio in corso…',updateFailed:'Controllo/installazione aggiornamento fallito. È necessario riprovare per continuare il setup.',devname:'Dai un nome a questo player',devnameHelp:'Usato come nome di rete (es. "salotto" → salotto.local) e come nome Bluetooth/multiroom. Solo lettere, numeri e trattini — lascia vuoto per mantenere quello predefinito.',devnameSaving:'Salvataggio…',mode:'Modalità dispositivo',modeGui:'Con schermo (touchscreen)',modeHeadless:'Headless (senza schermo)',modeOff:'Solo server (player spento)',modeHelp:'In headless/solo server gestisci tutto da questa interfaccia web.',pointer:'Puntatore del mouse',pointerHelp:'Mostrare il cursore del mouse a schermo? Lascialo spento per un touchscreen — accendilo se usi il dispositivo con un mouse.',pointerHide:'Touchscreen (nascondi puntatore)',pointerShow:'Mouse (mostra puntatore)',audio:'Uscita audio',audioContinue:'Continua',lyrion:'Server musicale (Lyrion)',lyrionLocal:'Usa questo dispositivo come server',lyrionFollow:'Usa un server già presente sulla rete',lyrionHost:'Indirizzo del server',lyrionUse:'Usa questo server',lyrionInstall:'Installa Lyrion',lyrionChecking:'Verifica se Lyrion Music Server è installato…',lyrionMissing:'Lyrion Music Server non è ancora installato.',lyrionInstalling:'Installazione di Lyrion Music Server…',lyrionUnpacking:'Installazione di Lyrion Music Server… Su una chiavetta USB questo passo può richiedere diversi minuti.',lyrionDownloading:'Scaricamento di Lyrion Music Server…',lyrionRestarting:'Riavvio di Lyrion Music Server…',lyrionInstallFailed:'Installazione di Lyrion non riuscita.',continueAnyway:'Continua comunque',skinTitle:'Aspetto del player web',skinHelp:"Scegli l'aspetto del player web di Lyrion (la pagina che apri da browser o telefono). Osmium è coerente con l'interfaccia di questo dispositivo.",skinOsmium:'Osmium (consigliata)',skinMaterial:'Material',skinInstalling:"Installazione dell'interfaccia web Material…",skinApplying:'Applicazione della skin…',skinDone:'Skin applicata.',skinFailed:'Impossibile applicare la skin. Controlla la rete e riprova.',lmsPlugins:'Servizi musicali',lmsPluginsHelp:'Scegli cosa aggiungere al tuo server musicale. Puoi aggiungerli o rimuoverli in seguito da Lyrion.',lmsPluginsGo:'Installa e continua',lmsPluginsSkip:'Salta, non aggiungere nulla',nextBtn:'Avanti',plgPageOf:'Pagina {n} di {total}',plgLater:'Puoi aggiungerli o toglierli in seguito da Lyrion.',grp_streaming:'Servizi di streaming',grpd_streaming:'Hai un abbonamento? Spunta i servizi che vuoi ascoltare su questo apparecchio.',grp_radio:'Radio via internet',grpd_radio:'Aggiunte per ascoltare le stazioni radio via internet.',grp_info:'Informazioni sulla musica',grpd_info:'Più dettagli su artisti e album mentre ascolti.',analyticsTick:'Invia statistiche anonime di utilizzo',lmsPluginsInstalling:'Installazione dei servizi selezionati…',lmsPluginsApplying:'Completamento della configurazione del server musicale…',lmsPluginsDone:'Server musicale pronto.',lmsPluginsFailed:'Impossibile completare la configurazione del server musicale.',plg_MusicArtistInfo:'Info artisti e album',plgd_MusicArtistInfo:'Biografie, recensioni e testi dentro al player.',plg_Spotty:'Spotify',plgd_Spotty:'Riproduci il tuo account Spotify Premium su questo player.',plg_TIDAL:'TIDAL',plgd_TIDAL:'Ascolta con il tuo abbonamento TIDAL.',plg_Qobuz:'Qobuz',plgd_Qobuz:'Ascolta con il tuo abbonamento Qobuz.',plg_Deezer:'Deezer',plgd_Deezer:'Ascolta con il tuo abbonamento Deezer.',plg_RadioNowPlaying:'Info brani radio',plgd_RadioNowPlaying:'Mostra brano e copertina di quello che sta passando in radio.',plg_RadioNet:'Radio.net',plgd_RadioNet:'Sfoglia la directory di radio internet Radio.net.',analytics:'Aiuta a migliorare Lyrion (facoltativo)',analyticsHelp:"Ogni due giorni invia alla community di Lyrion (stats.lms-community.org) un identificativo anonimo, la versione e il sistema operativo, l'elenco dei plugin attivi e quanti brani e player hai. Nessun dato personale, nessun titolo dei brani. Puoi cambiare idea più avanti da Lyrion.",sources:'Sorgenti musicali',sourcesAskIntro:'Vuoi configurare sorgenti come un NAS o un disco rigido interno? I dispositivi esterni (USB) si montano già automaticamente — per quelli non serve fare nulla.',sourcesYes:'Sì, configura le sorgenti',sourcesNo:'No, salta questo passaggio',sourcesTypeIntro:'Scegli cosa aggiungere. Puoi aggiungerne più di una prima di continuare.',addNas:'Unità di rete (NAS)',addInternal:'Disco interno',sourcesDone:'Fatto, continua',sourcesFinishing:'Completamento in corso…',backBtn:'Indietro',cancelBtn:'Annulla',smbWizIntro:"La musica tenuta su un NAS o su un altro computer. Il lettore la cerca da solo sulla tua rete: a te basta scegliere.",smbSearching:'Cerco i dispositivi sulla tua rete',smbNothing:"Non ho trovato niente. Controlla che l'altro dispositivo sia acceso e sulla stessa rete, oppure scrivi tu il suo indirizzo.",smbSearchAgain:'Cerca ancora',smbTypeIt:'Lo scrivo io',smbAddress:'Nome o indirizzo del dispositivo',smbManualHint:'Per esempio nas.local oppure 192.168.1.20.',smbOnDevice:'Su {device}',smbAuthHint:'Questo dispositivo vuole sapere chi sei. Usa lo stesso nome utente e la stessa password che usi su di esso.',smbSignIn:'Accedi',smbSignInTo:'Accedi a {device}',smbUserLabel:'Nome utente',smbWrongPassword:'Nome utente o password sbagliati. Riprova.',smbChangeUser:'Cambia',smbLoadingShares:'Leggo le cartelle condivise…',smbShareLabel:'Nome della cartella condivisa',smbTypeShareHint:"Scrivilo esattamente come appare sull'altro dispositivo.",smbNoShares:'Questo dispositivo non condivide nessuna cartella.',smbNeedPassword:'Chiede una password',smbDevice:'Dispositivo',smbFolder:'Cartella',smbAllowWrite:'Permetti al lettore di scrivere in questa cartella',smbWriteHint:'Permette al lettore di salvarci dentro: serve per copiarci i CD. Spegnilo se la cartella deve solo essere ascoltata.',smbAddNow:'Aggiungi questa cartella',smbListFailed:'Non sono riuscito a leggere le cartelle condivise di questo dispositivo.',smbOpenFailed:'Non sono riuscito ad aprire questa cartella.',smbShowDetail:'Dettagli tecnici',smbNoClientHint:"Questo lettore non sa ancora leggere l'elenco delle cartelle condivise: aggiornalo e la prossima volta te le proporrà.",smbConnecting:'Connessione in corso…',smbConnected:'Connesso!',smbFolderTitle:'Scegli cosa aggiungere',smbFolderIntro:"Usa l'intera condivisione, oppure apri una cartella per usarne solo una parte.",smbFolderUp:'Su',smbFolderUse:'Usa questa cartella',smbFolderNoSubfolders:'Nessuna sottocartella qui.',smbFolderSaving:'Salvataggio…',internalIntro:'Scegli un disco da usare per la tua libreria musicale.',internalLoading:'Caricamento…',internalNone:'Nessun disco interno trovato.',internalAlreadyUsed:'Già in uso',internalUseBtn:'Usa questo disco',internalFormatBtn:'Formatta questo disco',internalAdopting:'Aggiunta in corso…',formatTitle:'Formatta disco',formatFs:'Filesystem',formatLabel:'Nome del disco',formatWarn:'Questo CANCELLERÀ TUTTI I DATI su {disk}.',formatConfirmMsg:'Digita {label} qui sotto per confermare.',formatGo:'Formatta ora',formatting:"Formattazione in corso — può richiedere un po' di tempo…",formatDoneMsg:'Fatto — il disco è pronto all\\'uso.',continueBtn:'Continua',timezone:'Fuso orario',tzSave:'Salva e continua',account:'Account amministratore web',accountHelp:"Usato per accedere all'interfaccia web di questo dispositivo (http://…) da ora in poi.",username:'Nome utente',password:'Password',confirmPassword:'Conferma password',createAccount:'Crea account',creating:'Creazione…',accountMismatch:'Le password non coincidono.',accountTooShort:'Nome utente di almeno 3 caratteri, password di almeno 8.',finishGui:'Modalità con schermo impostata. Il setup è completo — premi "Completa setup" qui sotto: l\\'hotspot si spegnerà, riconnetti il telefono alla tua rete. Il dispositivo avvierà poi la sua normale interfaccia a schermo.',finishHeadless:'Modalità headless impostata. Premi "Completa setup" qui sotto: l\\'hotspot si spegnerà, riconnetti il telefono alla tua rete e apri http://hifiplayer.local',finishOff:'Modalità solo server impostata — questo dispositivo non riprodurrà audio in locale. Premi "Completa setup" qui sotto: l\\'hotspot si spegnerà, riconnetti il telefono alla tua rete e apri http://hifiplayer.local',finishBtn:'Completa setup',finishDone:'Setup completato — hotspot spento. Apri http://hifiplayer.local dalla tua rete.',finishToLyrion:'Setup completato. Apro il player web…',rebootTitle:'Riavvio in corso…',rebootGoingDown:'Il dispositivo si sta riavviando.',rebootComingBack:'In attesa che il dispositivo torni online.',rebootAuto:'Questa pagina si ricollegherà automaticamente — non serve aggiornarla.',remoteTitle:'Vuoi configurare un telecomando?',remoteIntro:"Un telecomando comanda tutta l'interfaccia sullo schermo. Quello USB funziona appena infili la chiavetta; uno Bluetooth lo puoi accoppiare da qui.",remoteNone:'Ancora nessun telecomando collegato.',remoteViaUsb:'USB',remoteViaBluetooth:'Bluetooth',remoteViaOther:'Collegato',remoteBtHint:"Bluetooth: metti il telecomando in accoppiamento — di solito si tiene premuto un tasto finché la spia lampeggia — poi scansiona e toccalo nell'elenco.",remoteScan:'Scansiona',remoteSearching:'Sto cercando…',remotePairing:'Accoppiamento in corso…',remotePaired:'Accoppiato.',remoteWaiting:"Accoppiato. Aspetto che l'apparecchio lo colleghi…",remoteReady:'Pronto — è già scelto qui sotto: premi «Usa questo».',remoteNotYet:'Accoppiato, ma non si è ancora fatto vivo. Premi un tasto sul telecomando per svegliarlo, poi scansiona di nuovo.',remoteNothing:'Non ho trovato niente. Metti il telecomando in accoppiamento e scansiona ancora.',remoteFailed:'Non sono riuscito ad accoppiare questo telecomando.',remoteNoBt:"Il Bluetooth non è ancora disponibile su questo apparecchio: si può usare solo un telecomando USB.",remoteAskFailed:"Non sono riuscito a chiedere all'apparecchio che telecomandi ha. Riprova fra un momento.",remoteNeedsUpdate:"Il sistema di questo apparecchio non è abbastanza nuovo per accoppiare un telecomando Bluetooth. Installa l'ultimo aggiornamento e riprova.",remotePick:'Telecomando da usare',remotePickNone:'— nessuno —',remotePickEmpty:'— nessun telecomando collegato —',remoteUse:'Usa questo',remoteUsing:"Fatto: ora è questo a comandare l'interfaccia.",remoteUnset:'Nessun telecomando in uso.',remotePickFailed:'Non sono riuscito a impostare questo telecomando.',remoteLater:'Puoi saltarlo e farlo più avanti da Impostazioni → Telecomando.',remoteWhich:'Quale telecomando hai?',remoteOther:'Un altro telecomando',remoteHow_firetv:'Tieni premuto il tasto Home (⌂) finché la luce in alto non lampeggia.',remoteHow_xiaomi:'Tieni premuti insieme il tasto ⋮⋮⋮ e il tasto ○ per 7–8 secondi, finché la luce non lampeggia.',remoteHow_g20s:'Tieni premuti insieme OK e Indietro per 5–7 secondi, finché la luce non lampeggia.',remoteCertWait:'Poi lascialo vicino all’apparecchio: lo trovo e lo collego da solo.',remoteCertLooking:'Sto cercando il tuo {name}…',remoteCertPaired:'{name} collegato!',remoteCertNotYet:'Non lo trovo ancora. Controlla che la luce lampeggi, poi riprova.',remoteRetry:'Riprova',remoteChangeModel:'Un altro telecomando',rmiTitle:'Il tuo telecomando {name} è pronto',rmiBody:'Ecco cosa fa ogni tasto su Osmium.',rmiLater:'Puoi rivederla quando vuoi da Impostazioni → Telecomando.',rmiGotIt:'Ho capito',error:'Errore: '}
+ en:{restoreIntro:'Setting up a new device? Restore a previous backup, or start fresh.',fresh:'Start fresh',restoreFile:'Backup file',restorePass:'Backup password',restore:'Restore from backup',restoring:'Restoring…',restoreOverlayTitle:'Restoring from backup…',restoreDone:'Restore complete. Rebooting to apply it — reconnect in about a minute.',restoreFailed:'Restore failed.',restoreNoFile:'Choose a backup file first.',wifi:'Wi-Fi network',ssid:'Or enter the network name (SSID)',pass:'Wi-Fi password',connect:'Connect via Wi-Fi',wired:"I'm connected via cable (Ethernet)",connecting:'Connecting… the setup Wi-Fi will turn off. Reconnect your phone to your home network, then open http://hifiplayer.local to continue setup where you left off.',noCable:'No cable detected',netIntro:'Connect this device to your home network so it can finish setting up and be reachable from your phone/PC afterwards.',stepLabel:'Step {n} of {total}',audioIntro:'Pick the DAC / output device this player should send audio to. You can change this later from Settings.',lyrionIntro:'Choose where your music library lives: on this device, or on a Lyrion server you already run elsewhere on your network.',timezoneIntro:'Used for the clock, alarms and any scheduled tasks on this device.',updateRequired:'Update required',updateNow:'Update now',updateChecking:'Checking for updates…',updateAutoStarting:'An update is available and required — starting it now…',updateApplying:'Updating — this can take a few minutes…',updateDoneRebooting:'Update complete. Rebooting…',updateFailed:'Update check/install failed. Retrying is required to continue setup.',devname:'Name this player',devnameHelp:'Used as its network name (e.g. "livingroom" → livingroom.local) and its Bluetooth/multiroom name. Letters, numbers and dashes only — leave empty to keep the default.',devnameSaving:'Saving…',mode:'Device mode',modeGui:'With screen (touchscreen)',modeHeadless:'Headless (no screen)',modeOff:'Server only (player off)',modeHelp:'In headless/server-only you manage everything from this web interface.',pointer:'Mouse pointer',pointerHelp:"Show the mouse cursor on screen? Leave it off for a touchscreen — turn it on if you're driving this device with a mouse.",pointerHide:'Touchscreen (hide pointer)',pointerShow:'Mouse (show pointer)',audio:'Audio output',audioContinue:'Continue',lyrion:'Music server (Lyrion)',lyrionLocal:'Use this device as the server',lyrionFollow:'Use a server already on my network',lyrionHost:'Server address',lyrionUse:'Use this server',lyrionInstall:'Install Lyrion',lyrionChecking:'Checking whether Lyrion Music Server is installed…',lyrionMissing:"Lyrion Music Server isn't installed yet.",lyrionInstalling:'Installing Lyrion Music Server…',lyrionUnpacking:'Installing Lyrion Music Server… On a USB stick this step can take several minutes.',lyrionDownloading:'Downloading Lyrion Music Server…',lyrionRestarting:'Restarting Lyrion Music Server…',lyrionInstallFailed:'Lyrion install failed.',continueAnyway:'Continue anyway',skinTitle:'Web player look',skinHelp:"Choose the look of Lyrion's web player (the page you open from a browser or phone). Osmium matches this device's interface.",skinOsmium:'Osmium (recommended)',skinMaterial:'Material',skinInstalling:'Installing the Material web interface…',skinApplying:'Applying the skin…',skinDone:'Skin applied.',skinFailed:"Couldn't apply the skin. Check the network connection and try again.",lmsPlugins:'Music services',lmsPluginsHelp:'Choose what to add to your music server. You can add or remove these later from Lyrion.',lmsPluginsGo:'Install and continue',lmsPluginsSkip:'Skip, add nothing',nextBtn:'Next',plgPageOf:'Page {n} of {total}',plgLater:'You can add or remove these later from Lyrion.',grp_streaming:'Streaming services',grpd_streaming:'Do you have a subscription? Tick the services you want to listen to on this device.',grp_radio:'Internet radio',grpd_radio:'Extras for listening to radio stations over the internet.',grp_info:'About your music',grpd_info:'More details on artists and albums while you listen.',analyticsTick:'Send anonymous usage statistics',lmsPluginsInstalling:'Installing the selected services…',lmsPluginsApplying:'Finishing the music server setup…',lmsPluginsDone:'Music server ready.',lmsPluginsFailed:"Couldn't finish the music server setup.",plg_MusicArtistInfo:'Artist and album info',plgd_MusicArtistInfo:'Biographies, album reviews and lyrics inside the player.',plg_Spotty:'Spotify',plgd_Spotty:'Play your Spotify Premium account through this player.',plg_TIDAL:'TIDAL',plgd_TIDAL:'Listen with your TIDAL subscription.',plg_Qobuz:'Qobuz',plgd_Qobuz:'Listen with your Qobuz subscription.',plg_Deezer:'Deezer',plgd_Deezer:'Listen with your Deezer subscription.',plg_RadioNowPlaying:'Radio track info',plgd_RadioNowPlaying:'Shows the track and cover art playing on internet radio.',plg_RadioNet:'Radio.net',plgd_RadioNet:'Browse the Radio.net internet radio directory.',analytics:'Help improve Lyrion (optional)',analyticsHelp:'Every couple of days, sends an anonymous ID, the version and operating system, the list of active plugins and how many tracks and players you have to the Lyrion community (stats.lms-community.org). No personal data, no track titles. You can change this later from Lyrion.',sources:'Music sources',sourcesAskIntro:'Do you want to set up sources like a NAS or an internal hard disk? External devices (USB) already mount automatically — nothing to do for those.',sourcesYes:'Yes, set up sources',sourcesNo:'No, skip this',sourcesTypeIntro:'Choose what to add. You can add more than one before continuing.',addNas:'Network drive (NAS)',addInternal:'Internal disk',sourcesDone:'Done, continue',sourcesFinishing:'Finishing…',backBtn:'Back',cancelBtn:'Cancel',smbWizIntro:"Music kept on a NAS or another computer. The player looks for them on your network; you only have to pick one.",smbSearching:'Looking for devices on your network',smbNothing:'Nothing found. Check that the other device is switched on and on the same network, or type its address yourself.',smbSearchAgain:'Search again',smbTypeIt:"I'll type it myself",smbAddress:'Name or address of the device',smbManualHint:'For example nas.local or 192.168.1.20.',smbOnDevice:'On {device}',smbAuthHint:'This device wants to know who you are. Use the same username and password you use on it.',smbSignIn:'Sign in',smbSignInTo:'Sign in to {device}',smbUserLabel:'Username',smbWrongPassword:'Wrong username or password. Try again.',smbChangeUser:'Change',smbLoadingShares:'Reading the shared folders…',smbShareLabel:'Shared folder name',smbTypeShareHint:'Type it exactly as it appears on the other device.',smbNoShares:'This device is not sharing any folder.',smbNeedPassword:'It asks for a password',smbDevice:'Device',smbFolder:'Folder',smbAllowWrite:'Let the player write into this folder',smbWriteHint:'Lets the player save into it — needed to copy CDs onto it. Turn it off if the folder only has to be listened to.',smbAddNow:'Add this folder',smbListFailed:'Could not read the shared folders from this device.',smbOpenFailed:'Could not open this folder.',smbShowDetail:'Technical details',smbNoClientHint:'This player cannot read the list of shared folders yet: update it and it will offer them next time.',smbConnecting:'Connecting…',smbConnected:'Connected!',smbFolderTitle:'Choose what to add',smbFolderIntro:'Use the whole share, or open a folder to use just part of it.',smbFolderUp:'Up',smbFolderUse:'Use this folder',smbFolderNoSubfolders:'No subfolders here.',smbFolderSaving:'Saving…',internalIntro:'Pick a disk to use for your music library.',internalLoading:'Loading…',internalNone:'No internal disks found.',internalAlreadyUsed:'Already in use',internalUseBtn:'Use this disk',internalFormatBtn:'Format this disk',internalAdopting:'Adding…',formatTitle:'Format disk',formatFs:'Filesystem',formatLabel:'Disk name',formatWarn:'This will ERASE ALL DATA on {disk}.',formatConfirmMsg:'Type {label} below to confirm.',formatGo:'Format now',formatting:'Formatting — this can take a while…',formatDoneMsg:'Done — the disk is ready to use.',continueBtn:'Continue',timezone:'Time zone',tzSave:'Save and continue',account:'Web admin account',accountHelp:"Used to log into this device's web interface (http://…) from now on.",username:'Username',password:'Password',confirmPassword:'Confirm password',createAccount:'Create account',creating:'Creating…',accountMismatch:'Passwords do not match.',accountTooShort:'Username needs at least 3 characters, password at least 8.',finishGui:'Screen mode set. Setup is complete — press "Complete setup" below: the hotspot will turn off, reconnect your phone to your network. The device will then start its normal on-screen interface.',finishHeadless:'Headless mode set. Press "Complete setup" below: the hotspot will turn off, reconnect your phone to your network and open http://hifiplayer.local',finishOff:'Server-only mode set — this device will not play audio locally. Press "Complete setup" below: the hotspot will turn off, reconnect your phone to your network and open http://hifiplayer.local',finishBtn:'Complete setup',finishDone:'Setup complete — hotspot off. Open http://hifiplayer.local from your network.',finishToLyrion:'Setup complete. Opening the web player…',rebootTitle:'Rebooting…',rebootGoingDown:'The device is restarting.',rebootComingBack:'Waiting for the device to come back online.',rebootAuto:'This page will reconnect automatically — no need to refresh.',remoteTitle:'Do you want to set up a remote control?',remoteIntro:'A remote works the whole on-screen interface. A USB one works the moment you plug its receiver in; a Bluetooth one can be paired right here.',remoteNone:'No remote connected yet.',remoteViaUsb:'USB',remoteViaBluetooth:'Bluetooth',remoteViaOther:'Connected',remoteBtHint:'Bluetooth: put the remote in pairing mode — usually holding a key until its light blinks — then scan and tap it in the list.',remoteScan:'Scan',remoteSearching:'Scanning…',remotePairing:'Pairing…',remotePaired:'Paired.',remoteWaiting:'Paired. Waiting for this device to connect it…',remoteReady:'Ready — it is picked below; press "Use this one".',remoteNotYet:'Paired, but it has not turned up yet. Press a key on the remote to wake it, then scan again.',remoteNothing:'Nothing found. Put the remote in pairing mode and scan again.',remoteFailed:'Could not pair with this remote.',remoteNoBt:'Bluetooth is not available on this device yet: only a USB remote can be used.',remoteAskFailed:'Could not ask this device about its remotes. Try again in a moment.',remoteNeedsUpdate:"This device's system is not new enough to pair a Bluetooth remote. Install the latest update and look again.",remotePick:'Remote to use',remotePickNone:'— none —',remotePickEmpty:'— no remote connected —',remoteUse:'Use this one',remoteUsing:'Done: this remote now drives the interface.',remoteUnset:'No remote in use.',remotePickFailed:'Could not set this remote.',remoteLater:'You can skip this and do it later from Settings → Remote control.',remoteWhich:'Which remote do you have?',remoteOther:'Another remote',remoteHow_firetv:'Hold the Home key (⌂) until the light at the top blinks.',remoteHow_xiaomi:'Hold the ⋮⋮⋮ key and the ○ key together for 7–8 seconds, until the light blinks.',remoteHow_g20s:'Hold OK and Back together for 5–7 seconds, until the light blinks.',remoteCertWait:'Then leave it near the device: it is found and connected by itself.',remoteCertLooking:'Looking for your {name}…',remoteCertPaired:'{name} connected!',remoteCertNotYet:'Not found yet. Check that its light is blinking, then try again.',remoteRetry:'Try again',remoteChangeModel:'Another remote',rmiTitle:'Your {name} remote is ready',rmiBody:'This is what each key does on Osmium.',rmiLater:'You can see it again any time from Settings → Remote control.',rmiGotIt:'Got it',driversTitle:'Missing a driver?',driversIntro:'If this device is missing a driver or firmware (for example Wi-Fi on a laptop), insert the USB stick with the driver pack and press Search.',driversScan:'Search the USB stick',driversScanning:'Searching the USB stick…',driversNone:'No driver pack found on the USB stick.',driversSigOk:'signature OK',driversSigBad:'invalid signature',driversInstall:'Install',driversInstalling:'Installing…',driversFailed:'Driver installation failed.',driversSkip:'Skip',error:'Error: '},
+ it:{restoreIntro:'Stai configurando un nuovo dispositivo? Ripristina un backup precedente, oppure inizia da zero.',fresh:'Inizia da zero',restoreFile:'File di backup',restorePass:'Password del backup',restore:'Ripristina da backup',restoring:'Ripristino in corso…',restoreOverlayTitle:'Ripristino da backup in corso…',restoreDone:'Ripristino completato. Riavvio in corso per applicarlo — riconnettiti tra circa un minuto.',restoreFailed:'Ripristino non riuscito.',restoreNoFile:'Scegli prima un file di backup.',wifi:'Rete Wi-Fi',ssid:'Oppure inserisci il nome (SSID)',pass:'Password Wi-Fi',connect:'Connetti via Wi-Fi',wired:'Sono connesso via cavo (Ethernet)',connecting:'Connessione in corso… il Wi-Fi di setup si spegnerà. Riconnetti il telefono alla tua rete di casa, poi apri http://hifiplayer.local per continuare la configurazione da dove l\\'hai lasciata.',noCable:'Nessun cavo rilevato',netIntro:'Collega questo dispositivo alla tua rete di casa così può completare la configurazione ed essere raggiungibile da telefono/PC in seguito.',stepLabel:'Passo {n} di {total}',audioIntro:'Scegli il DAC / dispositivo di uscita a cui questo player deve inviare l\\'audio. Puoi cambiarlo in seguito dalle Impostazioni.',lyrionIntro:'Scegli dove vive la tua libreria musicale: su questo dispositivo, oppure su un server Lyrion che hai già altrove sulla tua rete.',timezoneIntro:'Usato per l\\'orologio, le sveglie e qualsiasi attività pianificata su questo dispositivo.',updateRequired:'Aggiornamento richiesto',updateNow:'Aggiorna ora',updateChecking:'Controllo aggiornamenti…',updateAutoStarting:'È disponibile un aggiornamento obbligatorio — avvio in corso…',updateApplying:'Aggiornamento in corso — può richiedere qualche minuto…',updateDoneRebooting:'Aggiornamento completato. Riavvio in corso…',updateFailed:'Controllo/installazione aggiornamento fallito. È necessario riprovare per continuare il setup.',devname:'Dai un nome a questo player',devnameHelp:'Usato come nome di rete (es. "salotto" → salotto.local) e come nome Bluetooth/multiroom. Solo lettere, numeri e trattini — lascia vuoto per mantenere quello predefinito.',devnameSaving:'Salvataggio…',mode:'Modalità dispositivo',modeGui:'Con schermo (touchscreen)',modeHeadless:'Headless (senza schermo)',modeOff:'Solo server (player spento)',modeHelp:'In headless/solo server gestisci tutto da questa interfaccia web.',pointer:'Puntatore del mouse',pointerHelp:'Mostrare il cursore del mouse a schermo? Lascialo spento per un touchscreen — accendilo se usi il dispositivo con un mouse.',pointerHide:'Touchscreen (nascondi puntatore)',pointerShow:'Mouse (mostra puntatore)',audio:'Uscita audio',audioContinue:'Continua',lyrion:'Server musicale (Lyrion)',lyrionLocal:'Usa questo dispositivo come server',lyrionFollow:'Usa un server già presente sulla rete',lyrionHost:'Indirizzo del server',lyrionUse:'Usa questo server',lyrionInstall:'Installa Lyrion',lyrionChecking:'Verifica se Lyrion Music Server è installato…',lyrionMissing:'Lyrion Music Server non è ancora installato.',lyrionInstalling:'Installazione di Lyrion Music Server…',lyrionUnpacking:'Installazione di Lyrion Music Server… Su una chiavetta USB questo passo può richiedere diversi minuti.',lyrionDownloading:'Scaricamento di Lyrion Music Server…',lyrionRestarting:'Riavvio di Lyrion Music Server…',lyrionInstallFailed:'Installazione di Lyrion non riuscita.',continueAnyway:'Continua comunque',skinTitle:'Aspetto del player web',skinHelp:"Scegli l'aspetto del player web di Lyrion (la pagina che apri da browser o telefono). Osmium è coerente con l'interfaccia di questo dispositivo.",skinOsmium:'Osmium (consigliata)',skinMaterial:'Material',skinInstalling:"Installazione dell'interfaccia web Material…",skinApplying:'Applicazione della skin…',skinDone:'Skin applicata.',skinFailed:'Impossibile applicare la skin. Controlla la rete e riprova.',lmsPlugins:'Servizi musicali',lmsPluginsHelp:'Scegli cosa aggiungere al tuo server musicale. Puoi aggiungerli o rimuoverli in seguito da Lyrion.',lmsPluginsGo:'Installa e continua',lmsPluginsSkip:'Salta, non aggiungere nulla',nextBtn:'Avanti',plgPageOf:'Pagina {n} di {total}',plgLater:'Puoi aggiungerli o toglierli in seguito da Lyrion.',grp_streaming:'Servizi di streaming',grpd_streaming:'Hai un abbonamento? Spunta i servizi che vuoi ascoltare su questo apparecchio.',grp_radio:'Radio via internet',grpd_radio:'Aggiunte per ascoltare le stazioni radio via internet.',grp_info:'Informazioni sulla musica',grpd_info:'Più dettagli su artisti e album mentre ascolti.',analyticsTick:'Invia statistiche anonime di utilizzo',lmsPluginsInstalling:'Installazione dei servizi selezionati…',lmsPluginsApplying:'Completamento della configurazione del server musicale…',lmsPluginsDone:'Server musicale pronto.',lmsPluginsFailed:'Impossibile completare la configurazione del server musicale.',plg_MusicArtistInfo:'Info artisti e album',plgd_MusicArtistInfo:'Biografie, recensioni e testi dentro al player.',plg_Spotty:'Spotify',plgd_Spotty:'Riproduci il tuo account Spotify Premium su questo player.',plg_TIDAL:'TIDAL',plgd_TIDAL:'Ascolta con il tuo abbonamento TIDAL.',plg_Qobuz:'Qobuz',plgd_Qobuz:'Ascolta con il tuo abbonamento Qobuz.',plg_Deezer:'Deezer',plgd_Deezer:'Ascolta con il tuo abbonamento Deezer.',plg_RadioNowPlaying:'Info brani radio',plgd_RadioNowPlaying:'Mostra brano e copertina di quello che sta passando in radio.',plg_RadioNet:'Radio.net',plgd_RadioNet:'Sfoglia la directory di radio internet Radio.net.',analytics:'Aiuta a migliorare Lyrion (facoltativo)',analyticsHelp:"Ogni due giorni invia alla community di Lyrion (stats.lms-community.org) un identificativo anonimo, la versione e il sistema operativo, l'elenco dei plugin attivi e quanti brani e player hai. Nessun dato personale, nessun titolo dei brani. Puoi cambiare idea più avanti da Lyrion.",sources:'Sorgenti musicali',sourcesAskIntro:'Vuoi configurare sorgenti come un NAS o un disco rigido interno? I dispositivi esterni (USB) si montano già automaticamente — per quelli non serve fare nulla.',sourcesYes:'Sì, configura le sorgenti',sourcesNo:'No, salta questo passaggio',sourcesTypeIntro:'Scegli cosa aggiungere. Puoi aggiungerne più di una prima di continuare.',addNas:'Unità di rete (NAS)',addInternal:'Disco interno',sourcesDone:'Fatto, continua',sourcesFinishing:'Completamento in corso…',backBtn:'Indietro',cancelBtn:'Annulla',smbWizIntro:"La musica tenuta su un NAS o su un altro computer. Il lettore la cerca da solo sulla tua rete: a te basta scegliere.",smbSearching:'Cerco i dispositivi sulla tua rete',smbNothing:"Non ho trovato niente. Controlla che l'altro dispositivo sia acceso e sulla stessa rete, oppure scrivi tu il suo indirizzo.",smbSearchAgain:'Cerca ancora',smbTypeIt:'Lo scrivo io',smbAddress:'Nome o indirizzo del dispositivo',smbManualHint:'Per esempio nas.local oppure 192.168.1.20.',smbOnDevice:'Su {device}',smbAuthHint:'Questo dispositivo vuole sapere chi sei. Usa lo stesso nome utente e la stessa password che usi su di esso.',smbSignIn:'Accedi',smbSignInTo:'Accedi a {device}',smbUserLabel:'Nome utente',smbWrongPassword:'Nome utente o password sbagliati. Riprova.',smbChangeUser:'Cambia',smbLoadingShares:'Leggo le cartelle condivise…',smbShareLabel:'Nome della cartella condivisa',smbTypeShareHint:"Scrivilo esattamente come appare sull'altro dispositivo.",smbNoShares:'Questo dispositivo non condivide nessuna cartella.',smbNeedPassword:'Chiede una password',smbDevice:'Dispositivo',smbFolder:'Cartella',smbAllowWrite:'Permetti al lettore di scrivere in questa cartella',smbWriteHint:'Permette al lettore di salvarci dentro: serve per copiarci i CD. Spegnilo se la cartella deve solo essere ascoltata.',smbAddNow:'Aggiungi questa cartella',smbListFailed:'Non sono riuscito a leggere le cartelle condivise di questo dispositivo.',smbOpenFailed:'Non sono riuscito ad aprire questa cartella.',smbShowDetail:'Dettagli tecnici',smbNoClientHint:"Questo lettore non sa ancora leggere l'elenco delle cartelle condivise: aggiornalo e la prossima volta te le proporrà.",smbConnecting:'Connessione in corso…',smbConnected:'Connesso!',smbFolderTitle:'Scegli cosa aggiungere',smbFolderIntro:"Usa l'intera condivisione, oppure apri una cartella per usarne solo una parte.",smbFolderUp:'Su',smbFolderUse:'Usa questa cartella',smbFolderNoSubfolders:'Nessuna sottocartella qui.',smbFolderSaving:'Salvataggio…',internalIntro:'Scegli un disco da usare per la tua libreria musicale.',internalLoading:'Caricamento…',internalNone:'Nessun disco interno trovato.',internalAlreadyUsed:'Già in uso',internalUseBtn:'Usa questo disco',internalFormatBtn:'Formatta questo disco',internalAdopting:'Aggiunta in corso…',formatTitle:'Formatta disco',formatFs:'Filesystem',formatLabel:'Nome del disco',formatWarn:'Questo CANCELLERÀ TUTTI I DATI su {disk}.',formatConfirmMsg:'Digita {label} qui sotto per confermare.',formatGo:'Formatta ora',formatting:"Formattazione in corso — può richiedere un po' di tempo…",formatDoneMsg:'Fatto — il disco è pronto all\\'uso.',continueBtn:'Continua',timezone:'Fuso orario',tzSave:'Salva e continua',account:'Account amministratore web',accountHelp:"Usato per accedere all'interfaccia web di questo dispositivo (http://…) da ora in poi.",username:'Nome utente',password:'Password',confirmPassword:'Conferma password',createAccount:'Crea account',creating:'Creazione…',accountMismatch:'Le password non coincidono.',accountTooShort:'Nome utente di almeno 3 caratteri, password di almeno 8.',finishGui:'Modalità con schermo impostata. Il setup è completo — premi "Completa setup" qui sotto: l\\'hotspot si spegnerà, riconnetti il telefono alla tua rete. Il dispositivo avvierà poi la sua normale interfaccia a schermo.',finishHeadless:'Modalità headless impostata. Premi "Completa setup" qui sotto: l\\'hotspot si spegnerà, riconnetti il telefono alla tua rete e apri http://hifiplayer.local',finishOff:'Modalità solo server impostata — questo dispositivo non riprodurrà audio in locale. Premi "Completa setup" qui sotto: l\\'hotspot si spegnerà, riconnetti il telefono alla tua rete e apri http://hifiplayer.local',finishBtn:'Completa setup',finishDone:'Setup completato — hotspot spento. Apri http://hifiplayer.local dalla tua rete.',finishToLyrion:'Setup completato. Apro il player web…',rebootTitle:'Riavvio in corso…',rebootGoingDown:'Il dispositivo si sta riavviando.',rebootComingBack:'In attesa che il dispositivo torni online.',rebootAuto:'Questa pagina si ricollegherà automaticamente — non serve aggiornarla.',remoteTitle:'Vuoi configurare un telecomando?',remoteIntro:"Un telecomando comanda tutta l'interfaccia sullo schermo. Quello USB funziona appena infili la chiavetta; uno Bluetooth lo puoi accoppiare da qui.",remoteNone:'Ancora nessun telecomando collegato.',remoteViaUsb:'USB',remoteViaBluetooth:'Bluetooth',remoteViaOther:'Collegato',remoteBtHint:"Bluetooth: metti il telecomando in accoppiamento — di solito si tiene premuto un tasto finché la spia lampeggia — poi scansiona e toccalo nell'elenco.",remoteScan:'Scansiona',remoteSearching:'Sto cercando…',remotePairing:'Accoppiamento in corso…',remotePaired:'Accoppiato.',remoteWaiting:"Accoppiato. Aspetto che l'apparecchio lo colleghi…",remoteReady:'Pronto — è già scelto qui sotto: premi «Usa questo».',remoteNotYet:'Accoppiato, ma non si è ancora fatto vivo. Premi un tasto sul telecomando per svegliarlo, poi scansiona di nuovo.',remoteNothing:'Non ho trovato niente. Metti il telecomando in accoppiamento e scansiona ancora.',remoteFailed:'Non sono riuscito ad accoppiare questo telecomando.',remoteNoBt:"Il Bluetooth non è ancora disponibile su questo apparecchio: si può usare solo un telecomando USB.",remoteAskFailed:"Non sono riuscito a chiedere all'apparecchio che telecomandi ha. Riprova fra un momento.",remoteNeedsUpdate:"Il sistema di questo apparecchio non è abbastanza nuovo per accoppiare un telecomando Bluetooth. Installa l'ultimo aggiornamento e riprova.",remotePick:'Telecomando da usare',remotePickNone:'— nessuno —',remotePickEmpty:'— nessun telecomando collegato —',remoteUse:'Usa questo',remoteUsing:"Fatto: ora è questo a comandare l'interfaccia.",remoteUnset:'Nessun telecomando in uso.',remotePickFailed:'Non sono riuscito a impostare questo telecomando.',remoteLater:'Puoi saltarlo e farlo più avanti da Impostazioni → Telecomando.',remoteWhich:'Quale telecomando hai?',remoteOther:'Un altro telecomando',remoteHow_firetv:'Tieni premuto il tasto Home (⌂) finché la luce in alto non lampeggia.',remoteHow_xiaomi:'Tieni premuti insieme il tasto ⋮⋮⋮ e il tasto ○ per 7–8 secondi, finché la luce non lampeggia.',remoteHow_g20s:'Tieni premuti insieme OK e Indietro per 5–7 secondi, finché la luce non lampeggia.',remoteCertWait:'Poi lascialo vicino all’apparecchio: lo trovo e lo collego da solo.',remoteCertLooking:'Sto cercando il tuo {name}…',remoteCertPaired:'{name} collegato!',remoteCertNotYet:'Non lo trovo ancora. Controlla che la luce lampeggi, poi riprova.',remoteRetry:'Riprova',remoteChangeModel:'Un altro telecomando',rmiTitle:'Il tuo telecomando {name} è pronto',rmiBody:'Ecco cosa fa ogni tasto su Osmium.',rmiLater:'Puoi rivederla quando vuoi da Impostazioni → Telecomando.',rmiGotIt:'Ho capito',driversTitle:'Manca un driver?',driversIntro:'Se a questo dispositivo manca un driver o un firmware (per esempio il Wi-Fi su un portatile), inserisci la chiavetta USB con il pacchetto driver e premi Cerca.',driversScan:'Cerca sulla USB',driversScanning:'Ricerca sulla chiavetta…',driversNone:'Nessun pacchetto driver trovato sulla chiavetta USB.',driversSigOk:'firma valida',driversSigBad:'firma non valida',driversInstall:'Installa',driversInstalling:'Installazione…',driversFailed:'Installazione driver non riuscita.',driversSkip:'Salta',error:'Errore: '}
 };
 // Chosen once, up front, on step-lang -- persisted so it survives the
 // network step's own reload (Wi-Fi hands off from the setup hotspot to the
@@ -3267,9 +3645,13 @@ document.getElementById('btn-remote-retry').textContent=S.remoteRetry;
 document.getElementById('btn-remote-change').textContent=S.remoteChangeModel;
 document.getElementById('btn-remote-back').textContent=S.backBtn;
 document.getElementById('btn-remote-done').textContent=S.continueBtn;
+document.getElementById('lbl-drivers').textContent=S.driversTitle;
+document.getElementById('drivers-intro').textContent=S.driversIntro;
+document.getElementById('btn-drivers-scan').textContent=S.driversScan;
+document.getElementById('btn-drivers-skip').textContent=S.driversSkip;
 }
 
-var STEPS=['step-lang','step-restore','step-net','step-update','step-name','step-mode','step-pointer','step-audio','step-lyrion','step-lyrion-install','step-lms-skin','step-lms-plugins','step-account','step-timezone','step-sources-ask','step-sources-type','step-sources-smb','step-sources-smb-folder','step-sources-internal','step-remote','step-finish'];
+var STEPS=['step-lang','step-restore','step-net','step-update','step-name','step-mode','step-pointer','step-audio','step-lyrion','step-lyrion-install','step-lms-skin','step-lms-plugins','step-account','step-timezone','step-sources-ask','step-sources-type','step-sources-smb','step-sources-smb-folder','step-sources-internal','step-remote','step-drivers','step-finish'];
 var lyrionMode='local';
 var netPhaseDone=false;
 var restoringFromBackup=false;
@@ -4531,6 +4913,51 @@ function remotePair(mac,btn){
   },function(){btn.disabled=false;byId('remote-msg').textContent=S.remoteFailed});
 }
 
+// ── Driver step: scan a USB stick for signed .osmpack packs and install one.
+// USB is the primary, offline channel (the device may be missing the very
+// Wi-Fi it would need to download anything). The signature is verified on the
+// device; here we only surface the verdict and never offer Install for an
+// unsigned pack.
+var driversPollTimer=null;
+function driversScan(){
+  var btn=byId('btn-drivers-scan');btn.disabled=true;
+  byId('drivers-msg').textContent=S.driversScanning;byId('drivers-found').innerHTML='';
+  jpost('/api/system/drivers/usb/scan',{}).then(function(r){
+    btn.disabled=false;byId('drivers-msg').textContent='';
+    var packs=(r&&r.packs)||[];
+    if(!packs.length){byId('drivers-msg').textContent=S.driversNone;return}
+    packs.forEach(function(p){
+      var ok=(p.signature==='valid');
+      var row=document.createElement('div');row.style.margin='8px 0';
+      var t=document.createElement('div');t.className='muted';
+      t.textContent=p.name+(p.description?' — '+p.description:'')+' · '+(ok?S.driversSigOk:S.driversSigBad);
+      row.appendChild(t);
+      if(ok&&p.path){
+        var b=document.createElement('button');b.className='sec';b.textContent=S.driversInstall;
+        b.onclick=function(){driversInstall(p.path,b)};
+        row.appendChild(b);
+      }
+      byId('drivers-found').appendChild(row);
+    });
+  },function(){btn.disabled=false;byId('drivers-msg').textContent=S.error+'scan'});
+}
+function driversInstall(path,btn){
+  btn.disabled=true;byId('drivers-msg').textContent=S.driversInstalling;
+  jpost('/api/system/drivers/install',{usb_pack:path}).then(function(){
+    driversPoll();
+  },function(){btn.disabled=false;byId('drivers-msg').textContent=S.driversFailed});
+}
+function driversPoll(){
+  if(driversPollTimer)clearTimeout(driversPollTimer);
+  jget('/api/system/drivers/status').then(function(s){
+    s=s||{};
+    if(s.message)byId('drivers-msg').textContent=s.message;
+    if(s.state==='done'){byId('btn-drivers-skip').textContent=S.continueBtn;return}
+    if(s.state==='error'){byId('drivers-msg').textContent=s.message||S.driversFailed;return}
+    driversPollTimer=setTimeout(driversPoll,1500);
+  },function(){driversPollTimer=setTimeout(driversPoll,2000)});
+}
+
 function showFinishScreen(){
   remoteCertModel='';                 // stops a search still running on the remote step
   show('step-finish');
@@ -4743,7 +5170,16 @@ def _bootstrap():
     app.secret_key = _ensure_secret_key()
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE='Strict',
+        # Lax, not Strict: the Now Playing web build (/np) is opened as a
+        # standalone/home-screen shortcut, a top-level navigation whose
+        # initiator the browser treats as cross-site -- Strict withholds the
+        # cookie there, so a logged-in user got a 401 unless they first passed
+        # through the admin page. Lax still sends the cookie on that top-level
+        # GET while continuing to withhold it on cross-site subresource/fetch
+        # and cross-site POST, which is what actually protects /device/* and
+        # the CSRF-guarded mutations (a cross-site page can only *drive* those
+        # through a subresource/POST, never a top-level navigation it can read).
+        SESSION_COOKIE_SAMESITE='Lax',
         # Not Secure: plain HTTP, no TLS -- see the module docstring's
         # security-model note. A Secure-flagged cookie would just get
         # silently dropped by the browser on every response.

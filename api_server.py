@@ -6,6 +6,7 @@ import shutil
 import signal
 import sys
 import socket
+
 import ssl
 import errno
 import email.utils
@@ -18,6 +19,7 @@ import urllib.parse
 import urllib.error
 import time
 import threading
+
 import queue
 import zipfile
 import io
@@ -342,6 +344,136 @@ def close_all_apps_and_restart():
         log.exception("close_all_apps_and_restart failed")
         return "Failed to close all apps and restart"
 
+# ──────────────────────────────────────────────────────────────────
+#  Hardware inventory for the dashboard "Status" card: the fixed facts
+#  about the box (CPU, RAM, which radios/ports it has, its disks), as
+#  opposed to the live figures in get_system_stats(). Every field is
+#  best-effort and independently None/empty-able: one unreadable sysfs
+#  node must never take the whole card down.
+# ──────────────────────────────────────────────────────────────────
+def _cpu_info():
+    """CPU model name and logical-core count. Falls back to the arch name
+    when /proc/cpuinfo has no 'model name' line (some ARM kernels)."""
+    model = None
+    try:
+        with open('/proc/cpuinfo', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if line.startswith('model name'):
+                    model = line.split(':', 1)[1].strip()
+                    break
+                # ARM exposes the part as "Hardware"/"Model" instead
+                if model is None and line.split(':', 1)[0].strip() in ('Model', 'Hardware'):
+                    model = line.split(':', 1)[1].strip()
+    except OSError:
+        pass
+    return {'model': model or platform.machine(), 'cores': os.cpu_count() or 1}
+
+
+def _ram_total_mb():
+    """Installed RAM in MB from /proc/meminfo (MemTotal is in kB)."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    return round(int(line.split()[1]) / 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _net_adapters_present():
+    """(has_wired, has_wireless): which kinds of network adapter the box
+    physically has, regardless of whether they are up or carrying a link.
+    A real adapter has a `device` symlink under /sys/class/net; a wireless
+    one also has a `wireless`/`phy80211` node. Virtual interfaces (lo,
+    bridges, veth, docker0, tailscale…) have neither and are skipped."""
+    wired = wireless = False
+    try:
+        for iface in os.listdir('/sys/class/net'):
+            if iface == 'lo':
+                continue
+            base = '/sys/class/net/' + iface
+            is_wifi = os.path.exists(base + '/wireless') or os.path.exists(base + '/phy80211')
+            if not is_wifi and not os.path.exists(base + '/device'):
+                continue  # virtual interface, not a real port
+            if is_wifi:
+                wireless = True
+            else:
+                wired = True
+    except OSError:
+        pass
+    return wired, wireless
+
+
+def _lsblk_truthy(v):
+    """lsblk -J reports rm/ro/rota as JSON booleans on util-linux ≥ 2.40
+    but as the strings "0"/"1" on older ones, where bool("0") is True."""
+    return v is True or str(v) in ('1', 'true', 'True')
+
+
+def _local_disks():
+    """The box's physical disks (one row per whole disk, no partitions):
+    model, size and how it is attached. Memory-backed and virtual block
+    devices (zram/ram/loop/nbd/dm) are left out, as in the installer."""
+    try:
+        r = _run(['lsblk', '-J', '-b', '-d', '-o', 'NAME,TYPE,SIZE,MODEL,TRAN,ROTA,RM'], timeout=10)
+        data = json.loads(r.stdout or '{}')
+    except Exception:
+        return []
+    disks = []
+    for dev in data.get('blockdevices', []):
+        name = dev.get('name') or ''
+        # Only real fixed/removable storage: no partitions, and no optical
+        # drive (type 'rom' -- shown as a CD, not a disk), no memory-backed
+        # or virtual devices.
+        if dev.get('type') != 'disk':
+            continue
+        if not name or name.startswith(('nbd', 'zram', 'ram', 'loop', 'dm-')):
+            continue
+        # eMMC hardware boot areas (mmcblkNboot0/boot1) are separate ~4 MiB
+        # block devices, not real storage. lsblk lists them as type 'disk',
+        # so they slip past the filters above and show up as "0.0 GB" rows.
+        # The installer and native UI leave them out -- do the same here.
+        if re.match(r'^mmcblk\d+boot\d+$', name):
+            continue
+        try:
+            size = int(dev.get('size') or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0:
+            continue
+        disks.append({
+            'name': name,
+            'size_gb': round(size / 1024 / 1024 / 1024, 1),
+            'model': (dev.get('model') or '').strip(),
+            'transport': (dev.get('tran') or '').strip(),
+            'rotational': _lsblk_truthy(dev.get('rota')),
+            'removable': _lsblk_truthy(dev.get('rm')),
+        })
+    return disks
+
+
+def _hardware_info():
+    """The hardware block merged into get_system_info(). Isolated so a
+    failure here degrades to empty fields, not a 500 on the whole route."""
+    try:
+        wired, wireless = _net_adapters_present()
+        return {
+            'cpu': _cpu_info(),
+            'ram_total_mb': _ram_total_mb(),
+            'has_wired': wired,
+            'has_wireless': wireless,
+            'has_bluetooth': _bt_adapter_present(),
+            'bt_connected': _bt_any_connected(),
+            'disks': _local_disks(),
+        }
+    except Exception:
+        log.exception("_hardware_info failed")
+        return {'cpu': None, 'ram_total_mb': None, 'has_wired': False,
+                'has_wireless': False, 'has_bluetooth': False,
+                'bt_connected': False, 'disks': []}
+
+
 # Funzione per ottenere le informazioni di sistema
 def get_system_info():
     try:
@@ -387,7 +519,8 @@ def get_system_info():
             'arch': platform.machine(),
             'version': _installed_ui_version(),
             'local_ip': local_ip,
-            'network_interfaces': network_interfaces
+            'network_interfaces': network_interfaces,
+            **_hardware_info(),
         }
     except Exception:
         log.exception("get_system_info failed")
@@ -398,7 +531,8 @@ def get_system_info():
             'version': _installed_ui_version(),
             'local_ip': 'Unknown',
             'network_interfaces': [],
-            'error': _t('system.infoFetchFailed', _lang())
+            'error': _t('system.infoFetchFailed', _lang()),
+            **_hardware_info(),
         }
 
 def _sysfs(path):
@@ -7761,6 +7895,19 @@ def _bt_snapshot():
         return {}
 
 
+def _bt_any_connected():
+    """True when at least one Bluetooth device -- a speaker or a remote --
+    is currently connected, read from the supervisor's snapshot (no
+    bluetoothctl). Used by the dashboard to show Bluetooth among the active
+    links only when something is actually on it."""
+    snap = _bt_snapshot()
+    for key in ('speakers', 'remotes'):
+        for dev in (snap.get(key) or []):
+            if dev.get('connected'):
+                return True
+    return False
+
+
 def _bt_player_mac(mac):
     """A stable, unique player id for the speaker's squeezelite.
 
@@ -11955,6 +12102,14 @@ def api_recommendations():
         items = rec.read_recommendations(db) if settings['enabled'] else []
     finally:
         db.close()
+    # `tracks` is stored as a JSON string (captured for streaming albums); hand
+    # clients a real list so the kiosk can render a tracklist without parsing.
+    for it in items:
+        raw = it.get('tracks')
+        try:
+            it['tracks'] = json.loads(raw) if raw else []
+        except (ValueError, TypeError):
+            it['tracks'] = []
     st['running'] = _recommend_running()
     if not settings['enabled']:
         st['state'] = 'disabled'
@@ -11976,7 +12131,128 @@ def api_recommendations_dismiss():
     return jsonify({'success': True})
 
 
+@app.route('/recommendations/block_artist', methods=['POST'])
+def api_recommendations_block_artist():
+    """The "–" on a recommended album: blacklist its artist (never offered or
+    seeded again) and drop the tapped album from the current list at once."""
+    body = request.get_json(silent=True) or {}
+    artist = str(body.get('artist') or '')[:300]
+    key = str(body.get('album_key') or '')[:400]
+    if rec is None or not artist:
+        return jsonify({'success': False}), 400
+    db = rec.open_db()
+    try:
+        rec.block_artist(db, artist)
+        if key:
+            rec.dismiss(db, key)
+    finally:
+        db.close()
+    return jsonify({'success': True})
+
+
+@app.route('/recommendations/blocked', methods=['GET'])
+def api_recommendations_blocked():
+    """The blacklist, for the management list in Settings → Recommended."""
+    if rec is None:
+        return jsonify({'available': False, 'artists': []})
+    db = rec.open_db()
+    try:
+        artists = rec.blocked_artist_list(db)
+    finally:
+        db.close()
+    return jsonify({'available': True, 'artists': artists})
+
+
+@app.route('/recommendations/unblock', methods=['POST'])
+def api_recommendations_unblock():
+    key = str((request.get_json(silent=True) or {}).get('key') or '')[:400]
+    if rec is None or not key:
+        return jsonify({'success': False}), 400
+    db = rec.open_db()
+    try:
+        rec.unblock_artist(db, key)
+    finally:
+        db.close()
+    return jsonify({'success': True})
+
+
 @app.route('/recommendations/run', methods=['POST'])
+def api_recommendations_run():
+    # Thin HTTP wrapper: the helper returns a bool (it is also called internally
+    # at boot), and a bare bool is not a valid Flask response — returning it
+    # here would 500 the request, so the admin UI's "Compute now" always showed
+    # "The computation could not be started" even when the job did start.
+    return jsonify({'success': _recommend_start_manual()})
+
+
+def _recommend_start_manual():
+    """Start the compute job at once, at the same low priority as the scheduled
+    one. Returns True if it is now going (started here or already running)."""
+    if rec is None:
+        return False
+    if _recommend_running():
+        return True
+    try:
+        r = subprocess.run(
+            ['systemd-run', '--quiet', '--collect', '--unit', RECOMMEND_MANUAL_UNIT,
+             '-p', 'Nice=19', '-p', 'IOSchedulingClass=idle', '-p', 'CPUWeight=20',
+             '-p', 'MemoryMax=900M', '-p', 'RuntimeMaxSec=%d' % rec.RUN_TIMEOUT,
+             RECOMMEND_RUNNER],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            log.warning('recommend: manual run not started: %s',
+                           (r.stderr or r.stdout or '').strip()[:300])
+            return False
+        return True
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning('recommend: manual run not started: %s', e)
+        return False
+
+
+# Set once per boot: /run is tmpfs, so it is gone after a real power-on but
+# stays across API restarts within the same boot, keeping the boot scan to one.
+RECOMMEND_BOOT_MARK = '/run/hifi-recommend-boot.done'
+# Don't scan at boot if a run already finished this recently (box was left on
+# and the scheduled run just did it): half a day.
+RECOMMEND_BOOT_FRESH = 12 * 3600
+
+
+def _recommend_boot_run_if_due():
+    """On the first API start of a boot, kick off a scan when "update at
+    power-on" is on, unless the feature is off or a recent run already covers
+    it. Called once, after LMS has had time to come up."""
+    if rec is None:
+        return
+    try:
+        if os.path.exists(RECOMMEND_BOOT_MARK):
+            return
+    except OSError:
+        pass
+    # claim the boot before anything can fail, so a restart cannot double-fire
+    try:
+        with open(RECOMMEND_BOOT_MARK, 'w'):
+            pass
+    except OSError:
+        pass
+    try:
+        s = rec.load_settings()
+    except Exception:
+        return
+    if not (s.get('enabled') and s.get('run_on_boot')):
+        return
+    if _recommend_running():
+        return
+    try:
+        db = rec.open_db()
+        last = rec.history_state(db).get('last_run') or {}
+        fin = last.get('finished')
+        if fin and time.time() - fin < RECOMMEND_BOOT_FRESH:
+            return
+    except Exception:
+        pass
+    _recommend_start_manual()
+
+
 def api_recommendations_run():
     """"Compute now": the same job as the scheduled one, started at once and
     at the same low priority. Answers straight away; GET /recommendations
@@ -11985,20 +12261,7 @@ def api_recommendations_run():
         return jsonify({'success': False}), 400
     if _recommend_running():
         return jsonify({'success': True, 'running': True, 'started': False})
-    try:
-        r = subprocess.run(
-            ['systemd-run', '--quiet', '--collect', '--unit', RECOMMEND_MANUAL_UNIT,
-             '-p', 'Nice=19', '-p', 'IOSchedulingClass=idle', '-p', 'CPUWeight=20',
-             '-p', 'MemoryMax=900M', '-p', 'RuntimeMaxSec=%d' % rec.RUN_TIMEOUT,
-             RECOMMEND_RUNNER],
-            capture_output=True, text=True, timeout=30)
-        ok = r.returncode == 0
-        if not ok:
-            log.warning('recommend: manual run not started: %s',
-                           (r.stderr or r.stdout or '').strip()[:300])
-    except (OSError, subprocess.TimeoutExpired) as e:
-        ok = False
-        log.warning('recommend: manual run not started: %s', e)
+    ok = _recommend_start_manual()
     return jsonify({'success': ok, 'running': ok, 'started': ok}), (200 if ok else 500)
 
 
@@ -12047,6 +12310,11 @@ def _recommend_collector():
     db = None
     players, players_at = [], 0.0
     time.sleep(60)
+    try:
+        # Once per boot, after LMS has had a minute to come up.
+        _recommend_boot_run_if_due()
+    except Exception:
+        pass
     while True:
         try:
             now = time.monotonic()
@@ -12074,13 +12342,6 @@ def _recommend_collector():
 
 
 if __name__ == '__main__':
-    # Bind to loopback only. This API runs as root and exposes reboot/shutdown,
-    # OS/system updates and network reconfiguration with NO authentication; it is
-    # consumed solely by the local kiosk UI (src/utils/api.js → http://localhost:8000).
-    # Listening on 0.0.0.0 would hand every device on the LAN root-equivalent
-    # control of the appliance.
-    # threaded=True so a slow handler (apt/systemctl/network reconfig, or a
-    # 15s OTA fetch) doesn't block the kiosk UI's other requests behind it.
     _startup_network_recovery()
     threading.Thread(target=_resume_playback_after_boot, daemon=True).start()
     threading.Thread(target=_reconcile_rotation_boot, daemon=True, name='rotation-boot').start()

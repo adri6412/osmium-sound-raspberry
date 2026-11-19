@@ -32,6 +32,7 @@ data, Wikipedia text, the library's own tags).
 Only numpy and the standard library are required; onnxruntime is optional.
 """
 import hashlib
+import json
 import math
 import os
 import re
@@ -75,7 +76,12 @@ SERVICE_PLAYS_CAP = 10
 MAX_RESULTS = 40
 MAX_PER_ARTIST = 2
 MMR_LAMBDA = 0.7          # 1 = pure relevance, 0 = pure diversity
-LIBRARY_SHARE = 0.5       # of the list, when streaming albums compete for it
+LIBRARY_SHARE = 0.2       # of the list, when streaming albums compete for it:
+                          # with a service connected the owned albums keep only
+                          # a small slice (~8 of 40) and new streaming albums
+                          # take the rest, so the list surfaces discoveries, not
+                          # the collection. With no service it fills the list
+                          # (source_caps returns no caps), as a fallback.
 K_MIN, K_MAX = 2, 5
 MIN_POINTS_PER_CLUSTER = 4
 UNIFORM_COHESION = 0.95   # mean cosine to the one centre above which k = 1
@@ -100,6 +106,11 @@ CREATE TABLE IF NOT EXISTS dismissed (
     album_key TEXT PRIMARY KEY,
     ts REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS blocked_artists (
+    artist_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    ts REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS embeddings (
     text_hash TEXT PRIMARY KEY,
     model TEXT NOT NULL,
@@ -116,7 +127,8 @@ CREATE TABLE IF NOT EXISTS recommendations (
     score REAL NOT NULL,
     cluster INTEGER NOT NULL,
     album_key TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    tracks TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -168,6 +180,11 @@ def open_db(path=None):
         db.execute('PRAGMA journal_mode=WAL')
         db.execute('PRAGMA synchronous=NORMAL')
     db.executescript(SCHEMA)
+    # Migration: the `tracks` column was added later; older databases created
+    # before it need it back-filled (empty) so reads and writes line up.
+    cols = {r[1] for r in db.execute('PRAGMA table_info(recommendations)')}
+    if 'tracks' not in cols:
+        db.execute("ALTER TABLE recommendations ADD COLUMN tracks TEXT NOT NULL DEFAULT ''")
     return db
 
 
@@ -201,6 +218,36 @@ def dismiss(db, key, ts=None):
     db.commit()
 
 
+def blocked_artist_keys(db):
+    return {r[0] for r in db.execute('SELECT artist_key FROM blocked_artists')}
+
+
+def blocked_artist_list(db):
+    """The blacklist as the kiosk shows it: display name + its key, A→Z."""
+    return [{'key': r[0], 'name': r[1]} for r in db.execute(
+        'SELECT artist_key, name FROM blocked_artists ORDER BY name COLLATE NOCASE')]
+
+
+def block_artist(db, name, ts=None):
+    """Blacklist an artist: never seeded or offered again, and anything of
+    theirs already in the current list is dropped now."""
+    key = norm_text(name)
+    if not key:
+        return
+    db.execute('INSERT OR REPLACE INTO blocked_artists (artist_key, name, ts) '
+               'VALUES (?,?,?)', (key, name, time.time() if ts is None else ts))
+    for ak, art in db.execute(
+            'SELECT album_key, artist FROM recommendations').fetchall():
+        if norm_text(art) == key:
+            db.execute('DELETE FROM recommendations WHERE album_key = ?', (ak,))
+    db.commit()
+
+
+def unblock_artist(db, key):
+    db.execute('DELETE FROM blocked_artists WHERE artist_key = ?', (key,))
+    db.commit()
+
+
 def write_recommendations(db, rows, now=None):
     """Replace the whole list in one transaction: a reader sees the old list
     or the new one, never half of each."""
@@ -209,11 +256,12 @@ def write_recommendations(db, rows, now=None):
         db.execute('DELETE FROM recommendations')
         db.executemany(
             'INSERT INTO recommendations (rank, album, artist, cover, source, '
-            'play_kind, play_id, score, cluster, album_key, created_at) '
-            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            'play_kind, play_id, score, cluster, album_key, created_at, tracks) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
             [(i, r['album'], r['artist'], r.get('cover', ''), r['source'],
               r['play_kind'], r['play_id'], float(r['score']),
-              int(r['cluster']), album_key(r['artist'], r['album']), now)
+              int(r['cluster']), album_key(r['artist'], r['album']), now,
+              r.get('tracks', ''))
              for i, r in enumerate(rows)])
 
 
@@ -768,6 +816,7 @@ _TIME = re.compile(r'^([01]\d|2[0-3]):([0-5]\d)$')
 DEFAULT_SETTINGS = {
     'enabled': True,
     'schedule': {'mode': 'daily', 'days': [], 'time': '18:00'},
+    'run_on_boot': True,
     'sources': list(SOURCES),
     'lastfm_key': '',
 }
@@ -793,6 +842,7 @@ def clean_settings(data):
     return {
         'enabled': bool(data.get('enabled', True)),
         'schedule': {'mode': mode, 'days': days, 'time': when},
+        'run_on_boot': bool(data.get('run_on_boot', True)),
         'sources': [s for s in SOURCES if s in sources],
         'lastfm_key': re.sub(r'[^0-9a-fA-F]', '',
                              str(data.get('lastfm_key') or ''))[:64],
@@ -862,7 +912,7 @@ def merge_settings(current, change):
     current = clean_settings(current)
     change = change if isinstance(change, dict) else {}
     out = dict(current)
-    for k in ('enabled', 'schedule', 'sources'):
+    for k in ('enabled', 'schedule', 'run_on_boot', 'sources'):
         if k in change:
             out[k] = change[k]
     if isinstance(change.get('lastfm_key'), str):
@@ -931,7 +981,10 @@ def play_from_status(st):
 
 PROFILE_TTL_DAYS = 90
 PROFILE_RETRY_DAYS = 7        # an artist nobody knew: ask again after this
-MAX_NEW_PROFILES = 120
+MAX_NEW_PROFILES = 60         # artists enriched per run: a shorter burst is
+                             # gentler on MusicBrainz (shared User-Agent), the
+                             # rest waits for the next run
+MAX_ENRICH_FAILS = 6         # give up a run after this many HTTP errors in a row
 MAX_TAGS = 8
 MAX_RELATED = 8
 LASTFM_BASE = 'https://ws.audioscrobbler.com/2.0/'
@@ -1075,7 +1128,7 @@ def enrich(db, names, http, key='', limit=MAX_NEW_PROFILES, now=None, log=None):
     import json
     now = time.time() if now is None else now
     have, stale = load_profiles(db, names, now)
-    done = 0
+    done = fails = 0
     for name in names:
         k = norm_text(name)
         if k not in stale or http is None:
@@ -1087,10 +1140,19 @@ def enrich(db, names, http, key='', limit=MAX_NEW_PROFILES, now=None, log=None):
             prof, found = fetch_profile(name, http, key)
         except Exception as e:
             # Only the kind of error: a URL could carry the Last.fm key.
-            if log:
-                log.info('recommend: enrichment stopped (%s)', type(e).__name__)
-            break
+            # A dead link (OfflineError) is final — stop the run. A transient
+            # HTTP error (MusicBrainz 503/429, timeout, ...) is per-request:
+            # skip this artist (it stays stale, retried next run) and carry on,
+            # but give up once too many fail in a row (the host is hard-down).
+            if type(e).__name__ == 'OfflineError' or fails + 1 > MAX_ENRICH_FAILS:
+                if log:
+                    log.info('recommend: enrichment stopped (%s)', type(e).__name__)
+                break
+            done += 1          # the request was spent: keep the run's budget bounded
+            fails += 1
+            continue
         done += 1
+        fails = 0
         with db:
             db.execute('INSERT OR REPLACE INTO artist_info '
                        '(name_key, name, data, found, fetched_at) VALUES (?,?,?,?,?)',
@@ -1159,6 +1221,66 @@ def library_albums(rpc):
     return list(out.values())
 
 
+def _tracks_from_loop(loop):
+    """Pull a compact tracklist out of a plugin album's drilled menu loop.
+
+    We keep only what the kiosk's AlbumPage needs to render and play a track
+    on its own: title, a subtitle line, the duration and a stable play URL.
+    The per-track menu ids are positional and session-bound, so they are not
+    kept; the URL (a favourites_url or the row's own url) stays playable."""
+    out = []
+    for t in loop:
+        pre = t.get('presetParams') or {}
+        acts = t.get('actions') or {}
+        is_track = (t.get('goAction') == 'play' or t.get('style') == 'itemplay'
+                    or bool(acts.get('play')) or bool(acts.get('add'))
+                    or bool(pre.get('favorites_url')) or bool(t.get('url'))
+                    or t.get('isaudio') == 1 or t.get('type') == 'audio')
+        if not is_track:
+            continue
+        two = str(t.get('text') or '').split('\n')
+        title = str(two[0] if two and two[0] else
+                    (t.get('name') or t.get('title') or '')).strip()
+        if not title:
+            continue
+        sub = str(t.get('artist') or (two[1] if len(two) > 1 else '') or '').strip()
+        try:
+            dur = float(t.get('duration') or t.get('tracklength') or 0) or 0.0
+        except (TypeError, ValueError):
+            dur = 0.0
+        url = str(pre.get('favorites_url') or t.get('url') or '')
+        out.append({'title': title, 'sub': sub, 'dur': dur, 'url': url})
+    return out
+
+
+def _capture_rec_tracks(rpc, player, rows, log=None):
+    """For each published streaming album, drill its live menu path once (this
+    run's browse is still warm) and store the tracklist as JSON on the row.
+
+    Local-library albums (play_kind 'album_id') already browse to a tracklist
+    on the device, so they are skipped. A failed or empty drill leaves tracks
+    empty: the kiosk then shows the album's actions without a tracklist."""
+    if not player:
+        return
+    for r in rows:
+        if r.get('play_kind') != 'url':
+            continue
+        bi = r.get('browse_item')
+        source = r.get('source')
+        if not bi or not source:
+            continue
+        try:
+            res = rpc(player, [source, 'items', 0, 200,
+                               'item_id:%s' % bi, 'menu:1']) or {}
+            tracks = _tracks_from_loop(res.get('item_loop') or [])
+            if tracks:
+                r['tracks'] = json.dumps(tracks, ensure_ascii=False)
+        except Exception as e:
+            if log:
+                log.info('recommend: track capture failed for %r (%s)',
+                         r.get('album'), type(e).__name__)
+
+
 def _album_from_item(service, item):
     """A plugin's album row (menu format) → {album, artist, cover, play_id},
     or None when it carries nothing we could play later. The handle has to
@@ -1183,7 +1305,12 @@ def _album_from_item(service, item):
             url = 'qobuz://album:%s.qbz' % m.group(1)
     if not url:
         return None
-    return {'album': album, 'artist': artist, 'cover': icon, 'play_id': url}
+    # The menu path of this album row (e.g. "6.0"): a live, session-only handle
+    # we can drill once, while this run's browse is still warm, to capture the
+    # tracklist. It is useless later (positional), so it is never persisted.
+    browse_item = str((item.get('params') or {}).get('item_id') or '')
+    return {'album': album, 'artist': artist, 'cover': icon, 'play_id': url,
+            'browse_item': browse_item}
 
 
 class ServiceSearch:
@@ -1194,6 +1321,8 @@ class ServiceSearch:
         self.rpc, self.player, self.service = rpc, player, service
         self.node = None
         self.usable = None
+        self._snap = None          # owner's Qobuz recent searches, as found
+        self._snapped = False
 
     def _items(self, item_id=None, search=None, count=30, menu=False):
         cmd = [self.service, 'items', 0, count]
@@ -1237,33 +1366,27 @@ class ServiceSearch:
         """Up to ALBUMS_PER_SEARCH albums by `artist` on this service."""
         if not self.available():
             return []
-        before = None
-        if self.service == 'qobuz':
-            # Qobuz remembers every search in the owner's "recent searches".
-            # Ours must not show up there: skip a term that would reorder or
-            # push out one of theirs, and take ours back out afterwards.
-            before = self._qobuz_history()
-            if artist in before or len(before) >= 30:
-                return []
-        try:
-            cats = self._items(self.node, search=artist)
-            pick = None
-            for c in cats:
-                if norm_text(c.get('name')) in _ALBUM_WORDS or 'albums' in str(c.get('image') or ''):
-                    pick = c
-                    break
-            if pick is None:
-                i = _ALBUM_CATEGORY.get(self.service)
-                pick = cats[i] if i is not None and i < len(cats) else None
-            if pick is None:
-                return []
-            rows = self._items(pick.get('id'), count=40, menu=True)
-        finally:
-            if before is not None:
-                after = self._qobuz_history()
-                if len(after) == len(before) + 1 and after[-1] == artist:
-                    self.rpc(self.player, ['qobuz', 'recentsearches',
-                                           'delete:%d' % (len(after) - 1)])
+        if self.service == 'qobuz' and not self._snapped:
+            # Qobuz records every search in the owner's "recent searches", capped
+            # at 30. The old code skipped searching once that list was full (or
+            # held the term) so as not to pollute it -- but a real Qobuz user is
+            # always at the cap, so streaming discovery never ran. Instead we
+            # search regardless, snapshot the list once, and put it back exactly
+            # as it was in restore(): the owner loses and reorders nothing.
+            self._snap = self._qobuz_history()
+            self._snapped = True
+        cats = self._items(self.node, search=artist)
+        pick = None
+        for c in cats:
+            if norm_text(c.get('name')) in _ALBUM_WORDS or 'albums' in str(c.get('image') or ''):
+                pick = c
+                break
+        if pick is None:
+            i = _ALBUM_CATEGORY.get(self.service)
+            pick = cats[i] if i is not None and i < len(cats) else None
+        if pick is None:
+            return []
+        rows = self._items(pick.get('id'), count=40, menu=True)
         out = []
         for row in rows:
             a = _album_from_item(self.service, row)
@@ -1272,6 +1395,20 @@ class ServiceSearch:
             if len(out) >= ALBUMS_PER_SEARCH:
                 break
         return out
+
+    def restore(self):
+        """Put the owner's Qobuz recent-search list back as we found it, after
+        a run's searches have pushed our terms into it. Idempotent and a no-op
+        for services other than Qobuz or when we never searched."""
+        if self.service != 'qobuz' or not self._snapped:
+            return
+        try:
+            if self._qobuz_history() != self._snap:
+                self.rpc('', ['pref', 'plugin.qobuz:qobuz_recent_search',
+                              self._snap])
+        finally:
+            self._snapped = False
+            self._snap = None
 
 
 # Where each plugin keeps the owner's favourites, as the string tokens of its
@@ -1404,6 +1541,59 @@ def pick_player(rpc):
 
 MAX_HISTORY_ARTISTS = 300
 SEEDS_PER_RUN = MAX_SEARCHES_PER_SERVICE
+TAGS_PER_RUN = 4              # dominant genres/tags to pull fresh artists from
+GENRE_ARTISTS_PER_TAG = 12    # top artists Last.fm lists under one tag
+GENRE_SEED_SLOTS = 10         # of SEEDS_PER_RUN, kept for genre finds (not just
+                              # the "similar artists" graph)
+
+
+def _lastfm_tag_artists(tag, http, key, limit=GENRE_ARTISTS_PER_TAG):
+    """The artists Last.fm files under a genre/tag, most representative first.
+    Best-effort: empty without a key/client, and empty (never raising) on any
+    network trouble -- genre seeds only enrich discovery, so the run goes on
+    through the local-player searches even if this is unreachable."""
+    if not (key and tag) or http is None:
+        return []
+    try:
+        r = http.get_json(LASTFM_BASE + '?' + _qs(
+            {'method': 'tag.gettopartists', 'tag': tag, 'api_key': key,
+             'format': 'json', 'limit': limit}), group='lastfm')
+    except Exception:
+        return []
+    return [a.get('name') for a in ((r or {}).get('topartists') or {}).get('artist') or []
+            if a.get('name')]
+
+
+def genre_seeds(top, profiles, artist_w, http, key, taken, want, log=None):
+    """Up to `want` artists drawn from the listener's dominant genres, to seed
+    streaming search beyond the "similar artists" graph. `taken` holds the
+    name_keys already heard or seeded. Weighs each tag by how much listening it
+    accounts for, then rounds robin over the tags' top artists for variety."""
+    if want <= 0 or not key or http is None:
+        return []
+    weight = {}
+    for k in top:
+        p = profiles.get(k) or {}
+        for t in (p.get('genres') or []) + (p.get('tags') or []):
+            if norm_text(t):
+                weight[t] = weight.get(t, 0.0) + artist_w.get(k, 0.0)
+    tags = [t for t, _ in sorted(weight.items(), key=lambda kv: -kv[1])[:TAGS_PER_RUN]]
+    pools = [_lastfm_tag_artists(t, http, key) for t in tags]
+    picks, seen = [], set(taken)
+    for i in range(max((len(p) for p in pools), default=0)):
+        for pool in pools:
+            if i < len(pool):
+                nk = norm_text(pool[i])
+                if nk and nk not in seen:
+                    seen.add(nk)
+                    picks.append(pool[i])
+                    if len(picks) >= want:
+                        break
+        if len(picks) >= want:
+            break
+    if log and picks:
+        log.info('recommend: %d genre seeds from %s', len(picks), ', '.join(tags))
+    return picks
 
 
 def run(db, rpc, http=None, settings=None, embedder=None, now=None, log=None,
@@ -1463,6 +1653,9 @@ def run(db, rpc, http=None, settings=None, embedder=None, now=None, log=None,
             artist_w[k] = artist_w.get(k, 0.0) + w_more
     top = sorted((k for k in artist_w if k), key=lambda k: -artist_w[k])[:MAX_HISTORY_ARTISTS]
     exclude = heard_keys(db) | dismissed_keys(db)
+    # Artists the user put on the blacklist (the "–" on a recommended album):
+    # never seeded, never offered — in or out of the library.
+    blocked = blocked_artist_keys(db)
     # An album already in the library, or kept as a favourite on a service,
     # is not offered again from a service (`owned`, above).
 
@@ -1476,6 +1669,8 @@ def run(db, rpc, http=None, settings=None, embedder=None, now=None, log=None,
         if 'library' not in settings['sources']:
             continue
         if album_key(a['artist'], a['album']) in exclude:
+            continue
+        if norm_text(a['artist']) in blocked:
             continue
         cands.append(dict(a, source='library', play_kind='album_id', play_id=a['id']))
 
@@ -1493,9 +1688,11 @@ def run(db, rpc, http=None, settings=None, embedder=None, now=None, log=None,
     # 3. Streaming: more by the artists listened to, and albums by the names
     #    the sources put next to them.
     services = [s for s in settings['sources'] if s != 'library']
+    player = None
     if services:
         seeds, seed_keys = [], set()
         heard_artists = set(artist_w)
+        similar_cap = max(1, SEEDS_PER_RUN - GENRE_SEED_SLOTS)
         for k in top:
             related = [r for r in (profiles.get(k) or {}).get('related') or []
                        if norm_text(r) not in heard_artists]
@@ -1504,9 +1701,18 @@ def run(db, rpc, http=None, settings=None, embedder=None, now=None, log=None,
                 if nk and nk not in seed_keys:
                     seed_keys.add(nk)
                     seeds.append(name)
-            if len(seeds) >= SEEDS_PER_RUN:
+            if len(seeds) >= similar_cap:
                 break
-        seeds = seeds[:SEEDS_PER_RUN]
+        seeds = seeds[:similar_cap]
+        # Beyond the similar-artist graph: fresh artists of the genres listened
+        # to most, so the list can surface names nobody's "similar" list holds.
+        want = min(GENRE_SEED_SLOTS, SEEDS_PER_RUN - len(seeds))
+        for name in genre_seeds(top, profiles, artist_w, http, key,
+                                heard_artists | seed_keys | blocked, want, log):
+            seed_keys.add(norm_text(name))
+            seeds.append(name)
+        # A blacklisted artist is never searched (not even if listened to).
+        seeds = [s for s in seeds if norm_text(s) not in blocked]
         new_names = [s for s in seeds if norm_text(s) not in profiles]
         more, n = enrich(db, new_names, http, key,
                          limit=max(0, MAX_NEW_PROFILES - summary['fetched']), now=now, log=log)
@@ -1515,21 +1721,34 @@ def run(db, rpc, http=None, settings=None, embedder=None, now=None, log=None,
         player = pick_player(rpc)
         for service in services if player else []:
             search = ServiceSearch(rpc, player, service)
-            for name in seeds:
-                try:
-                    found = search.albums(name)
-                except Exception as e:
-                    if log:
-                        log.info('recommend: %s search failed (%s)', service, type(e).__name__)
-                    break
-                if not search.usable:
-                    break
-                summary['searches'] += 1
-                for a in found:
-                    k = album_key(a['artist'], a['album'])
-                    if k not in exclude and k not in owned:
-                        cands.append(dict(a, source=service, play_kind='url',
-                                          genres=[], year=None))
+            try:
+                for name in seeds:
+                    try:
+                        found = search.albums(name)
+                    except Exception as e:
+                        if log:
+                            log.info('recommend: %s search failed (%s)', service, type(e).__name__)
+                        break
+                    if not search.usable:
+                        break
+                    summary['searches'] += 1
+                    for a in found:
+                        k = album_key(a['artist'], a['album'])
+                        if (k not in exclude and k not in owned
+                                and norm_text(a['artist']) not in blocked):
+                            cands.append(dict(a, source=service, play_kind='url',
+                                              genres=[], year=None))
+            finally:
+                search.restore()      # un-pollute the owner's Qobuz history
+
+    # How many candidates each source put on the table, so an owner-reported
+    # imbalance (e.g. "almost only Tidal") can be traced to the gather stage
+    # rather than guessed at. This counts raw candidates, before ranking/caps.
+    cand_by_source = {}
+    for c in cands:
+        s = c.get('source') or '?'
+        cand_by_source[s] = cand_by_source.get(s, 0) + 1
+    summary['cand_by_source'] = cand_by_source
 
     if not cands:
         return dict(summary, outcome='no_candidates')
@@ -1551,8 +1770,18 @@ def run(db, rpc, http=None, settings=None, embedder=None, now=None, log=None,
     picked = rank(V, cands, C, cw, exclude=exclude, source_caps=source_caps(cands))
     picked = [(i, s, c) for i, s, c in picked if s > 0]
     rows = [dict(cands[i], score=s, cluster=c) for i, s, c in picked]
+    # Capture each streaming album's tracklist now, while this run's browse is
+    # still warm (the menu path in `browse_item` is live only for this session).
+    _capture_rec_tracks(rpc, player, rows, log)
     write_recommendations(db, rows, now)
     summary['items'] = len(rows)
+    # The source mix of the published list, next to cand_by_source above: the
+    # two together say whether an imbalance comes from the gather or the ranking.
+    picked_by_source = {}
+    for r in rows:
+        s = r.get('source') or '?'
+        picked_by_source[s] = picked_by_source.get(s, 0) + 1
+    summary['picked_by_source'] = picked_by_source
     return summary
 
 

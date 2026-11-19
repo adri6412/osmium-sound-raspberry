@@ -98,12 +98,29 @@
     "remoteAskFailed": "Could not ask this device about its remotes. Try again in a moment.",
     "remoteWaiting": "Paired. Waiting for this device to connect it…",
     "remoteReady": "Ready — it is picked below; press \"Use this one\".",
-    "remoteNotYet": "Paired, but it has not turned up yet. Press a key on the remote to wake it, then scan again."
+    "remoteNotYet": "Paired, but it has not turned up yet. Press a key on the remote to wake it, then scan again.",
+    "driversTitle": "External drivers",
+    "driversHint": "If Wi-Fi, touch or other hardware isn't working, Osmium can send you a signed driver pack. Install it from a USB stick or upload it here.",
+    "driversScan": "Search a USB stick",
+    "driversScanning": "Searching…",
+    "driversUpload": "Upload a driver pack",
+    "driversNoUsb": "No USB stick detected. Plug it in and try again.",
+    "driversNoPacks": "No drivers found on the USB stick.",
+    "driversInstalling": "Installing… this may take a moment.",
+    "driversFound": "Drivers found:",
+    "driversBadSignature": "Not signed by Osmium — won't be installed.",
+    "driversInstall": "Install",
+    "driversDone": "Driver installed. Restart the device to apply it.",
+    "driversFailed": "Installation failed.",
+    "driversNeedBoth": "Select both files: the .osmpack and its .sig signature.",
+    "driversSecureBoot": "To load kernel modules, turn Secure Boot off in the BIOS."
   },
   "dashboard": {
     "title": "Dashboard",
-    "music": "Music",
-    "musicDesc": "Library & playback (Lyrion)",
+    "music": "Lyrion",
+    "musicDesc": "Library & playback",
+    "nowPlaying": "Now Playing",
+    "nowPlayingDesc": "The full-screen playing view",
     "settings": "Settings",
     "settingsDesc": "Network, audio, updates…",
     "status": "Status",
@@ -117,6 +134,15 @@
     "onscreen": "On-screen",
     "cpu": "CPU",
     "ram": "RAM",
+    "connectivity": "Connectivity",
+    "processor": "Processor",
+    "cores": "{n} cores",
+    "ethernet": "Ethernet",
+    "bluetooth": "Bluetooth",
+    "disks": {
+      "title": "Disks",
+      "removable": "removable"
+    },
     "disk": {
       "title": "Disk space",
       "space": "Space",
@@ -300,6 +326,10 @@
       "systemTweaks": {
         "label": "System tweaks",
         "desc": "CPU governor, security, hyper-threading"
+      },
+      "drivers": {
+        "label": "External drivers",
+        "desc": "Install a signed driver/firmware pack from USB or upload"
       },
       "notices": {
         "label": "Licenses & credits",
@@ -492,6 +522,10 @@
       "ripTrack": "Track {track} of {total}",
       "ripDone": "Rip complete! The album is in the library.",
       "ripFailed": "The rip failed. Check the disc and try again.",
+      "viewLog": "View rip log",
+      "logTitle": "Rip log",
+      "logClose": "Close log",
+      "logUnavailable": "No log available for this rip.",
       "hint": "How an audio CD is copied into the library. Every control applies at once.",
       "saved": "Saved",
       "saveFailed": "Could not save",
@@ -1138,6 +1172,9 @@
       "kindOs": "Operating system",
       "kindImage": "System image",
       "updating": "Updating {label}",
+      "busyWarnRip": "Updating will stop the CD rip in progress. Continue?",
+      "busyWarnCopy": "Updating will stop the file copy in progress. Continue?",
+      "busyWarnBoth": "Updating will stop the CD rip and the file copy in progress. Continue?",
       "whatsNew": "What's new",
       "changelogTitle": "What's new in {version}",
       "progressState": {
