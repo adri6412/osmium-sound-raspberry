@@ -105,6 +105,24 @@ class Sandbox:
             f.write(cid + '\n')
         os.symlink(f'card{number}', os.path.join(self.asound, cid))
 
+    def hdmi(self, cid, number, rates='32000 44100 48000', dev=0,
+             prefix='[0xe0]', coding='LPCM PCM', eld=True):
+        """An HDMI/DP card: an HDA card (cardN + pcmXp/info + id symlink) that
+        also exposes an ELD at eld#<dev>, as the vc4/HDA HDMI codec does. The
+        onboard analog codec and USB/I2S DACs have no ELD. `prefix` is the
+        `[0x..]` bitmask the kernel prints before the rate list."""
+        self.hda(cid, number, {dev: cid})
+        if eld:
+            d = os.path.join(self.asound, f'card{number}')
+            with open(os.path.join(d, f'eld#{dev}'), 'w') as f:
+                f.write('monitor_present\t\t1\n'
+                        'eld_valid\t\t1\n'
+                        'monitor_name\t\tTEST-HDMI\n'
+                        'sad_count\t\t1\n'
+                        f'sad0_coding_type\t{coding}\n'
+                        f'sad0_rates\t{prefix} {rates}\n'
+                        f'sad0_bits\t{prefix} 16 20 24\n')
+
     def write_default(self, args, header="# legacy comment\n"):
         os.makedirs(os.path.dirname(self.default), exist_ok=True)
         with open(self.default, 'w') as f:
@@ -485,6 +503,65 @@ class TestOutputFallback(unittest.TestCase):
                               self.sb.probe, visualizer=False, zone=True)
         self.assertIn('hw:CARD=Lite,DEV=0', argv)
         self.assertNotIn('default', argv)
+
+
+class TestHdmiSink(unittest.TestCase):
+    """An HDMI/DP sink (a card with an ELD) renders through `plughw` at a FIXED
+    rate: the vc4 IEC958 link / an HDMI capture box only locks to the rate it
+    negotiated, and squeezelite's raw PCM on raw `hw:` cannot carry the IEC958
+    framing. So the renderer swaps `hw:`->`plughw:`, caps `-r` at the ELD's top
+    LPCM rate (fallback 48000) and adds `-R` so every track resamples to it.
+    USB/I2S DACs keep raw `hw:` and their native rate (bit-perfect)."""
+
+    def setUp(self):
+        self.sb = Sandbox()
+        self._saved_proc = sq.PROC_ASOUND
+        sq.PROC_ASOUND = self.sb.asound
+
+    def tearDown(self):
+        sq.PROC_ASOUND = self._saved_proc
+
+    def test_eld_max_rate_ignores_the_bitmask_prefix(self):
+        # The `[0x..]` prefix must be stripped before the numbers are read, so
+        # its hex digits never leak in as rates.
+        self.sb.hdmi('vc4hdmi1', 1, rates='32000 44100 48000', prefix='[0x7]')
+        card_dir = os.path.join(self.sb.asound, 'card1')
+        self.assertEqual(sq.eld_max_rate(card_dir), 48000)
+
+    def test_hdmi_uses_plughw_and_caps_at_the_eld(self):
+        self.sb.hdmi('vc4hdmi1', 1, rates='32000 44100 48000')
+        line = sq.render(sq.normalize({'output': 'hw:CARD=vc4hdmi1,DEV=0'}), self.sb.probe)
+        self.assertIn('-o plughw:CARD=vc4hdmi1,DEV=0 ', line)
+        self.assertNotIn('-o hw:CARD=vc4hdmi1', line)
+        self.assertIn('-r 48000 -R', line)
+
+    def test_cap_follows_the_sink(self):
+        # A sink that declares up to 192k caps there, not at 48k.
+        self.sb.hdmi('vc4hdmi1', 1, rates='44100 48000 96000 192000')
+        line = sq.render(sq.normalize({'output': 'hw:CARD=vc4hdmi1,DEV=0'}), self.sb.probe)
+        self.assertIn('-r 192000 -R', line)
+
+    def test_no_readable_eld_falls_back_to_48000(self):
+        # A card with an eld#* file but no parseable rate still gets plughw + 48k.
+        self.sb.hdmi('vc4hdmi1', 1, rates='', prefix='')
+        line = sq.render(sq.normalize({'output': 'hw:CARD=vc4hdmi1,DEV=0'}), self.sb.probe)
+        self.assertIn('-o plughw:CARD=vc4hdmi1,DEV=0 ', line)
+        self.assertIn('-r 48000 -R', line)
+
+    def test_user_max_rate_below_the_cap_wins(self):
+        self.sb.hdmi('vc4hdmi1', 1, rates='44100 48000 96000 192000')
+        line = sq.render(sq.normalize(
+            {'output': 'hw:CARD=vc4hdmi1,DEV=0', 'max_rate': 48000}), self.sb.probe)
+        self.assertIn('-r 48000 -R', line)
+        self.assertNotIn('192000', line)
+
+    def test_usb_dac_stays_on_raw_hw_with_no_forced_cap(self):
+        # No ELD -> not HDMI: a USB DAC keeps raw hw: and gets no -R / forced cap.
+        self.sb.card('D50s', STREAM_NATIVE_BE)
+        line = sq.render(sq.normalize({'output': 'hw:CARD=D50s,DEV=0'}), self.sb.probe)
+        self.assertIn('-o hw:CARD=D50s,DEV=0 ', line)
+        self.assertNotIn('plughw', line)
+        self.assertNotIn('-R', line)
 
 
 def _append_token(conf, default, asound, token, count):

@@ -335,6 +335,64 @@ def is_usb_card(card_dir):
             or bool(glob.glob(os.path.join(card_dir, 'stream[0-9]*'))))
 
 
+# ── HDMI / DisplayPort sinks ────────────────────────────────────────
+# An HDMI/DP output exposes an ELD (/proc/asound/card*/eld#*) describing the
+# connected sink; USB, I2S and the onboard analog codec do not. The vc4 HDMI on
+# the Pi 5/CM5 presents IEC958_SUBFRAME_LE and needs the mandatory IEC958
+# framing, which squeezelite's linear PCM does not carry, so a raw `hw:` fails
+# to open ("unable to open audio device with any supported format"). `plughw`
+# adds that framing (and only resamples above the sink's top rate, so it stays
+# bit-perfect below it). So for an HDMI sink the renderer uses `plughw:` and caps
+# `-r` at the sink's ELD-declared max rate; USB/I2S DACs stay on raw `hw:` and
+# keep their hi-res, bit-perfect path.
+def eld_max_rate(card_dir):
+    """Highest LPCM sample rate (among RATES) any SAD in the card's ELD files
+    declares; 0 when there is no ELD or nothing parses. ELD lines look like
+    `sad0_coding_type\tLPCM` and `sad0_rates\t[0x7] 32000 44100 48000`; the
+    `[0x..]` bitmask prefix is stripped before reading the numbers so its hex
+    digits do not leak in as rates."""
+    rates = {}      # SAD index -> set of declared rates
+    coding = {}     # SAD index -> coding type string
+    for path in glob.glob(os.path.join(card_dir, 'eld#*')):
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = re.match(r'\s*sad(\d+)_(coding_type|rates)\s+(.*)', line)
+            if not m:
+                continue
+            idx, field, val = m.group(1), m.group(2), m.group(3)
+            if field == 'coding_type':
+                coding[idx] = val
+            else:
+                nums = val.split(']', 1)[-1]   # drop the [0x..] bitmask prefix
+                rates.setdefault(idx, set()).update(int(n) for n in re.findall(r'\d+', nums))
+    lpcm = {r for idx, rs in rates.items() if 'LPCM' in coding.get(idx, 'LPCM') for r in rs}
+    pool = lpcm or {r for rs in rates.values() for r in rs}
+    usable = [r for r in pool if r in RATES]
+    return max(usable) if usable else 0
+
+
+def hdmi_sink(output, proc_asound=None):
+    """For an HDMI/DisplayPort output (its ALSA card exposes an ELD), return
+    (plughw form of `output`, ELD-derived max rate — falling back to 48000);
+    for anything else (USB, I2S, analog, `default`, `null`, a missing card)
+    return (`output`, 0) unchanged."""
+    card, _ = parse_device(output)
+    if card is None:
+        return output, 0
+    root = os.path.realpath(proc_asound or PROC_ASOUND)
+    card_dir = _card_dir(root, card)
+    if card_dir is None or is_usb_card(card_dir):
+        return output, 0
+    if not glob.glob(os.path.join(card_dir, 'eld#*')):
+        return output, 0
+    plug = output if output.startswith('plughw:') else re.sub(r'^hw:', 'plughw:', output)
+    return plug, (eld_max_rate(card_dir) or 48000)
+
+
 def _stream_text(device, proc_asound=None):
     """The /proc/asound stream file of a USB `device`, '' for anything else."""
     card, dev = parse_device(device)
@@ -1151,9 +1209,14 @@ def render_argv(model, probe_fn=None, visualizer=True, name=None, zone=False, pr
     pcm_only = dsp or player
     dop = False
     out = []
+    # An HDMI/DisplayPort sink needs `plughw` (IEC958 framing) and a rate capped
+    # at what its ELD declares; USB/I2S DACs stay on raw `hw:`. Only when `-o` is
+    # the real card (not dsp/player, which play into the Loopback) — see hdmi_sink.
+    real_out = not dsp and not player
+    hdmi_out, hdmi_cap = hdmi_sink(output, proc_asound) if real_out else (output, 0)
     if m['mac']:
         out += ['-m', m['mac']]
-    out += ['-o', LOOPBACK if dsp else p2d_playback(sub) if player else output]
+    out += ['-o', LOOPBACK if dsp else p2d_playback(sub) if player else hdmi_out]
     if not pcm_only:
         tok = dsd_token(m, fmt)
         if tok:
@@ -1168,8 +1231,21 @@ def render_argv(model, probe_fn=None, visualizer=True, name=None, zone=False, pr
         out += ['-r', str(P2D_RATE), '-R']
     elif up_player and up_rate:
         out += ['-r', str(up_rate), '-R']
-    elif m['max_rate']:
-        out += ['-r', str(m['max_rate'])]
+    else:
+        # On an HDMI sink cap `-r` at the ELD max (soxr resamples to it and the
+        # HELO to Lyrion advertises the right ceiling); a user max_rate still
+        # wins when it is lower. Off HDMI (hdmi_cap == 0) this is just max_rate.
+        rate = m['max_rate']
+        if hdmi_cap:
+            rate = min(rate, hdmi_cap) if rate else hdmi_cap
+        if rate:
+            out += ['-r', str(rate)]
+            # On an HDMI sink force a FIXED output rate (resample to it): the
+            # vc4 IEC958 link / an HDMI capture box only locks to the single
+            # rate it negotiated, so a 44.1 kHz track left at 44.1 kHz comes
+            # out silent. `-R` makes soxr resample every track to `rate`.
+            if hdmi_cap:
+                out.append('-R')
     # the Loopback has no volume control of its own: squeezelite's volume
     # acts on the PCM, before the conversion. A hardware mixer control belongs
     # to the chosen card, so drop it when we fell back to `null`: that card
