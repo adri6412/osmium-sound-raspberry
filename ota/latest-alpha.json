@@ -1,17 +1,17 @@
 {
-  "tag_name": "2.5.26-dev.6-alpha9",
-  "name": "2.5.26-dev.6-alpha9",
+  "tag_name": "2.5.26-dev.6-alpha10",
+  "name": "2.5.26-dev.6-alpha10",
   "body": "",
   "assets": [
     {
-      "name": "osmium-rpi-2.5.26-dev.6-alpha9.raucb",
-      "browser_download_url": "https://github.com/adri6412/osmium-sound-raspberry/releases/download/2.5.26-dev.6-alpha9/osmium-rpi-2.5.26-dev.6-alpha9.raucb",
-      "size": 668621490
+      "name": "osmium-rpi-2.5.26-dev.6-alpha10.raucb",
+      "browser_download_url": "https://github.com/adri6412/osmium-sound-raspberry/releases/download/2.5.26-dev.6-alpha10/osmium-rpi-2.5.26-dev.6-alpha10.raucb",
+      "size": 699525812
     },
     {
-      "name": "osmium-rpi-2.5.26-dev.6-alpha9.raucb.sha256",
-      "browser_download_url": "https://github.com/adri6412/osmium-sound-raspberry/releases/download/2.5.26-dev.6-alpha9/osmium-rpi-2.5.26-dev.6-alpha9.raucb.sha256",
-      "size": 103
+      "name": "osmium-rpi-2.5.26-dev.6-alpha10.raucb.sha256",
+      "browser_download_url": "https://github.com/adri6412/osmium-sound-raspberry/releases/download/2.5.26-dev.6-alpha10/osmium-rpi-2.5.26-dev.6-alpha10.raucb.sha256",
+      "size": 104
     }
   ]
 }
