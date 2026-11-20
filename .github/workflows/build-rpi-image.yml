@@ -10,7 +10,7 @@ name: Build Osmium Raspberry Pi image (manual)
 #     • version : e.g. 2.5.26-dev.6-alpha3 (goes into IMAGE_VERSION / RAUC manifest)
 #     • suite   : Debian suite (default: trixie — Qt6 needs Debian 13)
 #     • sign    : sign the RAUC bundle with the repo secrets (default: true).
-#     • publish : cut a GitHub Release + push the gh-pages manifest (needs sign).
+#     • publish : cut a GitHub Release + mirror to Oracle Object Storage (needs sign).
 #
 # Signing keys come from repository secrets, NEVER from the tree:
 #   RAUC_SIGNING_CERT / RAUC_SIGNING_KEY  the X.509 cert+key for the .raucb
@@ -18,12 +18,12 @@ name: Build Osmium Raspberry Pi image (manual)
 # The public keyring (distro/rauc-keys/keyring.pem) and OTA pubkey
 # (distro/ota-keys/ota-pubkey.pem) are checked in and used to verify.
 #
-# OTA is served git-only (api_server.py): the GitHub Releases API is the
-# always-available source (rate-limited 60/h/IP), and the gh-pages manifest
-# (ota/latest-<channel>.json, asset URLs on the Release CDN) is served the day a
-# CDN/Pages project is pointed at this repo's gh-pages branch — then it takes
-# priority over the API. No external object store (the former R2 mirror is gone,
-# no storage budget). Publishing the Release alone already makes OTA work.
+# OTA delivery (api_server.py): the primary manifest lives on Oracle Object
+# Storage (Milan, ota-rpi/latest-<channel>.json, read via a public READ PAR),
+# with the GitHub Releases API (rate-limited 60/h/IP) as the always-available
+# fallback. The old Cloudflare Pages / gh-pages manifest and the Cloudflare R2
+# mirror are both gone. Publishing the Release alone already makes OTA work (via
+# the API fallback); the Oracle mirror just adds a non-rate-limited CDN path.
 
 on:
   workflow_dispatch:
@@ -43,13 +43,13 @@ on:
         type: boolean
         default: true
       publish:
-        description: 'Publish a Release + gh-pages manifest for OTA (needs sign=true). Off = artifacts only, no tag.'
+        description: 'Publish a Release + Oracle Object Storage mirror for OTA (needs sign=true). Off = artifacts only, no tag.'
         required: false
         type: boolean
         default: false
 
-# contents: write is needed by the optional publish steps (gh release + gh-pages
-# push); harmless when publish=false (those steps are skipped).
+# contents: write is needed by the optional publish step (gh release); harmless
+# when publish=false (that step is skipped).
 permissions:
   contents: write
 
@@ -332,47 +332,20 @@ jobs:
             /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.img.xz.sha256
             /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.info.txt
 
-      # The device reads latest-<channel>.json from Cloudflare Pages first; the
-      # Release CDN serves the .raucb named in it. Push it to gh-pages/ota (the
-      # branch the Pages project watches).
-      - name: Build the OTA Pages manifest
-        if: ${{ inputs.publish && inputs.sign }}
-        id: pages_manifest
-        env:
-          EXTRA_ASSETS: osmium-rpi-${{ inputs.version }}.raucb osmium-rpi-${{ inputs.version }}.raucb.sha256
-        run: |
-          set -euo pipefail
-          cd /mnt/rpi-out
-          # Empty ui/sys/os tar args: this is an image-only release (the manifest
-          # script drops the empty names; the .raucb comes via EXTRA_ASSETS).
-          python3 "$GITHUB_WORKSPACE/.github/scripts/make-ota-manifest.py" \
-            "${{ inputs.version }}" "${{ github.repository }}" \
-            "${{ steps.channel.outputs.channel }}" "" "" ""
-          mkdir -p "$GITHUB_WORKSPACE/pages-ota/ota"
-          cp "manifest-out/latest-${{ steps.channel.outputs.channel }}.json" \
-             "$GITHUB_WORKSPACE/pages-ota/ota/"
-          cat "manifest-out/latest-${{ steps.channel.outputs.channel }}.json"
-
-      - name: Push OTA manifest to gh-pages branch
-        if: ${{ inputs.publish && inputs.sign }}
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./pages-ota
-          publish_branch: gh-pages
-          keep_files: true
-
-      # Mirror the bundle + channel manifest to Oracle Object Storage (Milan),
-      # the replacement for the retired Cloudflare R2 mirror. Upload goes through
-      # a WRITE Pre-Authenticated Request (secret OCI_PAR_WRITE_URL, scoped to the
+      # OTA delivery is Oracle Object Storage (Milan) as the single manifest
+      # source, with the GitHub REST API as the safety-net fallback. The old
+      # Cloudflare Pages / gh-pages manifest path was dropped (the Pages project
+      # never existed); api_server.py now reads the manifest straight from the
+      # Oracle READ PAR (OTA_MANIFEST_BASE == OTA_PROD_MIRROR_BASE).
+      #
+      # Mirror the bundle + channel manifest to Oracle Object Storage, the
+      # replacement for the retired Cloudflare R2 mirror. Upload goes through a
+      # WRITE Pre-Authenticated Request (secret OCI_PAR_WRITE_URL, scoped to the
       # ota-rpi/ prefix) with curl — no S3 keys, no awscli. The manifest is
-      # rebuilt with asset URLs pointing at a READ PAR (secret OCI_PAR_READ_URL,
-      # also ota-rpi/ prefix, public: it is the same token baked into
-      # OTA_PROD_MIRROR_BASE in api_server.py) so the device fetches the .raucb
-      # from the same mirror. The device reads latest-<channel>.json from that
-      # READ PAR when Cloudflare Pages is unreachable, before the rate-limited
-      # GitHub REST API fallback. Skips cleanly if the write secret is absent
-      # (GitHub Release + API still serve OTA git-only).
+      # rebuilt with asset URLs pointing at the READ PAR (public: the same token
+      # baked into OTA_PROD_MIRROR_BASE in api_server.py) so the device fetches
+      # the .raucb from the same mirror. Skips cleanly if the write secret is
+      # absent (the GitHub Release + REST API fallback still serve OTA).
       #
       # PAR URL shape: https://objectstorage.<region>.oraclecloud.com/p/<token>/
       # n/<ns>/b/<bucket>/o/  — an object named ota-rpi/<x> is PUT/GET at

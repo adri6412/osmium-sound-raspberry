@@ -24,7 +24,7 @@ systemd-sysext add-ons, the Qt kiosk on eglfs/KMS).
 | Kernel | Debian `linux-image-amd64` (pinned) | downstream Raspberry `linux-image-rpi-v8` (Pi4) + `linux-image-rpi-2712` (Pi5), `raspi-firmware`, `rpi-eeprom`, apt-pinned |
 | RAUC backend | GRUB | `bootloader=custom` → `hifi-rpi-boot.sh` (arms tryboot / commits on mark-good) |
 | Disk image | `build-usb-image.sh` (ESP + slots) | `build-image-rpi.sh`: GPT 6 partitions (selector FAT, 2 boot FATs, 2 raw root slots, data) |
-| OTA | `osmium-sound.pages.dev` + `file.osmiumsound.it/ota` + `hifi-image-*.raucb` | GitHub Release + `gh-pages/ota` manifest + Oracle Object Storage (Milan) `ota-rpi/` mirror + `osmium-rpi-*.raucb` |
+| OTA | `osmium-sound.pages.dev` + `file.osmiumsound.it/ota` + `hifi-image-*.raucb` | GitHub Release (tag + assets) + Oracle Object Storage (Milan) `ota-rpi/` manifest & mirror + GitHub REST API fallback + `osmium-rpi-*.raucb` |
 | DSP binary | CamillaDSP `amd64` | CamillaDSP `aarch64` |
 
 The firmware auto-selects `kernel8.img` on a Pi4 (BCM2711) and `kernel_2712.img`
@@ -41,7 +41,7 @@ on a Pi5 (BCM2712), plus the matching DTB, so the one image boots both boards.
 - `distro/config/includes.chroot/usr/local/sbin/hifi-rpi-reboot.sh` — tryboot reboot wrapper.
 - `distro/config/includes.chroot/usr/local/share/hifi-ab/system.conf.rpi` — RAUC `bootloader=custom`.
 - `distro/rauc/hook.sh` — `slot-post-install` assembles the new slot's boot FAT.
-- `.github/workflows/build-rpi-image.yml` — arm64 CI (payload + image + Release/R2/Pages).
+- `.github/workflows/build-rpi-image.yml` — arm64 CI (payload + image + Release + Oracle Object Storage mirror).
 
 ## 🚨 Still to verify on real hardware (cannot be tested without a Pi4/Pi5)
 
@@ -51,5 +51,6 @@ on a Pi5 (BCM2712), plus the matching DTB, so the one image boots both boards.
   version, and that `reboot "0 tryboot"` arms tryboot with the chosen kernel
   (vcmailbox `0x00038064` fallback needs `/dev/vcio`).
 - EEPROM recent enough for GPT `[boot_partition]` (rpi-eeprom ≥ 2025-03-10).
-- A Cloudflare Pages project pointed at this repo's `gh-pages` branch (for the
-  `osmium-sound-raspberry.pages.dev/ota` manifest) and the `ota-rpi/` R2 prefix.
+- The Oracle Object Storage READ/WRITE PARs do not expire silently mid-release
+  (they have a mandatory expiry; on lapse the device falls back to the GitHub
+  REST API and the CI mirror step is skipped with a warning).

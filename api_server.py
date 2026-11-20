@@ -102,13 +102,19 @@ OTA_REPO = os.environ.get('HIFI_OTA_REPO', 'adri6412/osmium-sound-raspberry')
 # falls back to the GitHub REST API whenever this URL is unreachable (which
 # it has been) -- they'll pick up whatever release carries this change via
 # that fallback, then use the fast path again from then on.
-OTA_MANIFEST_BASE = os.environ.get('HIFI_OTA_MANIFEST_BASE',
-                                   'https://osmium-sound-raspberry.pages.dev/ota')
-# Releases are mirrored to Oracle Object Storage (Milan), the replacement for the
-# retired Cloudflare R2 mirror now that R2 is out of storage budget. The release
-# workflow drops a copy of each channel's manifest next to the payloads
-# (ota-rpi/latest-<channel>.json) and the .raucb under ota-rpi/<tag>/. Read that
-# copy when Pages is unreachable, before resorting to the rate-limited GitHub API.
+# OTA is served from Oracle Object Storage (Milan) as the single manifest source,
+# with the GitHub REST API as the safety-net fallback. The old Cloudflare Pages
+# manifest (osmium-sound-raspberry.pages.dev) was dropped — that project never
+# existed — so the primary source and the "mirror" are now the same Oracle base:
+# the release workflow writes each channel's manifest at ota-rpi/latest-<channel>.json
+# and the .raucb under ota-rpi/<tag>/. Override via HIFI_OTA_MANIFEST_BASE.
+OTA_MANIFEST_BASE = os.environ.get(
+    'HIFI_OTA_MANIFEST_BASE',
+    'https://objectstorage.eu-milan-1.oraclecloud.com'
+    '/p/_ARLDmSI67zHinw2p25J7xB0rcQQkbpOPlxJ0qnT5NRI1-mf7q7kWXzoapJ2GSwS'
+    '/n/axdognj0blsq/b/bucket-osmiumsound-raspberry/o/ota-rpi')
+# Same Oracle base, kept as a second tap in the delivery chain before the GitHub
+# API fallback (historically the Pages-vs-mirror split; now one store).
 #
 # The URL carries a READ-only Pre-Authenticated Request token (/p/<token>/),
 # scoped to the ota-rpi/ prefix: the bucket is private, this token is what grants
@@ -9566,19 +9572,19 @@ def _fetch_release_chain(channel):
         # timeouts that cannot end any differently.
         raise OSError('update sources do not resolve: no network or no DNS')
 
-    # 1. Preferred: static manifest on Pages (a CDN, not rate-limited).
+    # 1. Preferred: the static manifest on the Oracle Object Storage mirror
+    #    (a CDN read, not rate-limited; same host the download comes from).
     if pages_host in reachable:
         try:
             release = _fetch_pages_manifest(channel)
             if release:
                 return release
-            log.warning("Pages manifest for channel %s empty; falling back to API", channel)
+            log.warning("mirror manifest for channel %s empty; falling back to API", channel)
         except Exception:
-            log.warning("Pages manifest fetch failed for channel %s; falling back to API", channel)
+            log.warning("mirror manifest fetch failed for channel %s; falling back to API", channel)
 
-    # 2. The copy of the manifest next to the payloads on the Oracle Object
-    #    Storage mirror (same host the download comes from anyway).
-    if mirror_host in reachable:
+    # 2. Same Oracle base via OTA_PROD_MIRROR_BASE (a second tap before the API).
+    if mirror_host in reachable and mirror_host != pages_host:
         try:
             release = _fetch_pages_manifest(channel, OTA_PROD_MIRROR_BASE)
             if release:
@@ -9594,8 +9600,8 @@ def _fetch_release_chain(channel):
 def _fetch_release(channel):
     """Fetch the release to offer for the given channel.
 
-    Source order: the static GitHub Pages manifest, its Oracle Object
-    Storage mirror, then the GitHub REST API (_fetch_release_chain).
+    Source order: the static manifest on the Oracle Object Storage mirror,
+    then the GitHub REST API fallback (_fetch_release_chain).
     The result is cached briefly; a failure is cached briefly too, and while
     it stands — or when the fetch fails outright — the last good release is
     reused so a momentary blip doesn't surface as an error.
