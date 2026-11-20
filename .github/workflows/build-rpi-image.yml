@@ -10,7 +10,7 @@ name: Build Osmium Raspberry Pi image (manual)
 #     • version : e.g. 2.5.26-dev.6-alpha3 (goes into IMAGE_VERSION / RAUC manifest)
 #     • suite   : Debian suite (default: trixie — Qt6 needs Debian 13)
 #     • sign    : sign the RAUC bundle with the repo secrets (default: true).
-#     • publish : cut a GitHub Release + mirror to R2/Pages for OTA (needs sign).
+#     • publish : cut a GitHub Release + push the gh-pages manifest (needs sign).
 #
 # Signing keys come from repository secrets, NEVER from the tree:
 #   RAUC_SIGNING_CERT / RAUC_SIGNING_KEY  the X.509 cert+key for the .raucb
@@ -18,12 +18,12 @@ name: Build Osmium Raspberry Pi image (manual)
 # The public keyring (distro/rauc-keys/keyring.pem) and OTA pubkey
 # (distro/ota-keys/ota-pubkey.pem) are checked in and used to verify.
 #
-# OTA reaches devices three ways (api_server.py): the Cloudflare Pages manifest
-# (osmium-sound-raspberry.pages.dev/ota — a Pages project the operator points at
-# this repo's gh-pages branch), the R2 mirror (file.osmiumsound.it/ota-rpi), and
-# the GitHub Releases API as the always-available fallback. Publishing the
-# Release alone already makes OTA work; the Pages/R2 steps just avoid the API
-# rate limit.
+# OTA is served git-only (api_server.py): the GitHub Releases API is the
+# always-available source (rate-limited 60/h/IP), and the gh-pages manifest
+# (ota/latest-<channel>.json, asset URLs on the Release CDN) is served the day a
+# CDN/Pages project is pointed at this repo's gh-pages branch — then it takes
+# priority over the API. No external object store (the former R2 mirror is gone,
+# no storage budget). Publishing the Release alone already makes OTA work.
 
 on:
   workflow_dispatch:
@@ -43,7 +43,7 @@ on:
         type: boolean
         default: true
       publish:
-        description: 'Publish a Release + R2/Pages manifest for OTA (needs sign=true). Off = artifacts only, no tag.'
+        description: 'Publish a Release + gh-pages manifest for OTA (needs sign=true). Off = artifacts only, no tag.'
         required: false
         type: boolean
         default: false
@@ -144,7 +144,7 @@ jobs:
             debootstrap debian-archive-keyring rsync fakeroot \
             squashfs-tools dosfstools mtools \
             rauc e2fsprogs zstd openssl initramfs-tools-core \
-            file fdisk gdisk mount util-linux awscli
+            file fdisk gdisk mount util-linux
 
       - uses: actions/checkout@v7
         with:
@@ -315,6 +315,11 @@ jobs:
         uses: softprops/action-gh-release@v2.2.1
         with:
           tag_name: ${{ inputs.version }}
+          # Tag the commit this image was actually built from, NOT the default
+          # branch. Without this the tag lands on main (an older commit), GitHub
+          # dates the release by that commit and orders it below newer alphas,
+          # so the device's GitHub-API fallback never offers it.
+          target_commitish: ${{ github.sha }}
           name: ${{ inputs.version }}
           body: "Osmium Sound image ${{ inputs.version }} for Raspberry Pi 4 & Pi 5 (RAUC A/B bundle for OTA, plus the flashable SD/USB image)."
           prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
@@ -357,33 +362,8 @@ jobs:
           publish_branch: gh-pages
           keep_files: true
 
-      # R2 mirror: a copy of the bundle and the channel manifest at
-      # file.osmiumsound.it/ota-rpi, read when Pages is unreachable, before the
-      # rate-limited GitHub API. OTA_ASSET_BASE rewrites the manifest URLs to R2.
-      - name: Mirror the bundle + manifest to R2
-        if: ${{ inputs.publish && inputs.sign }}
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: osmium-sound-iso-beta
-          CH: ${{ steps.channel.outputs.channel }}
-          TAG: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ] || [ -z "${R2_ENDPOINT:-}" ]; then
-            echo "::warning::R2 secrets not set — skipping the R2 mirror (Pages + GitHub API still serve OTA)"
-            exit 0
-          fi
-          cd /mnt/rpi-out
-          for f in "osmium-rpi-$TAG.raucb" "osmium-rpi-$TAG.raucb.sha256"; do
-            aws s3 cp "$f" "s3://$R2_BUCKET/ota-rpi/$TAG/$f" --endpoint-url "$R2_ENDPOINT" --only-show-errors
-          done
-          OTA_ASSET_BASE="https://file.osmiumsound.it/ota-rpi/$TAG" \
-          EXTRA_ASSETS="osmium-rpi-$TAG.raucb osmium-rpi-$TAG.raucb.sha256" \
-            python3 "$GITHUB_WORKSPACE/.github/scripts/make-ota-manifest.py" \
-              "$TAG" "${{ github.repository }}" "$CH" "" "" ""
-          aws s3 cp "manifest-out/latest-$CH.json" "s3://$R2_BUCKET/ota-rpi/latest-$CH.json" \
-            --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --only-show-errors
-          echo "mirrored osmium-rpi-$TAG.raucb and latest-$CH.json to R2 (ota-rpi/)"
+      # NOTE: no external object-store mirror here. OTA is served git-only —
+      # the GitHub Release (assets + tag) and the gh-pages manifest, whose asset
+      # URLs point at the Release CDN. The device reaches it via the GitHub REST
+      # API fallback (rate-limited 60/h/IP) until a CDN is pointed at gh-pages.
+      # An R2 mirror step used to live here; dropped (no storage budget).
