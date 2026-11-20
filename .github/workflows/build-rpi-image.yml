@@ -362,8 +362,49 @@ jobs:
           publish_branch: gh-pages
           keep_files: true
 
-      # NOTE: no external object-store mirror here. OTA is served git-only —
-      # the GitHub Release (assets + tag) and the gh-pages manifest, whose asset
-      # URLs point at the Release CDN. The device reaches it via the GitHub REST
-      # API fallback (rate-limited 60/h/IP) until a CDN is pointed at gh-pages.
-      # An R2 mirror step used to live here; dropped (no storage budget).
+      # Mirror the bundle + channel manifest to Oracle Object Storage (Milan),
+      # the replacement for the retired Cloudflare R2 mirror. Upload goes through
+      # a WRITE Pre-Authenticated Request (secret OCI_PAR_WRITE_URL, scoped to the
+      # ota-rpi/ prefix) with curl — no S3 keys, no awscli. The manifest is
+      # rebuilt with asset URLs pointing at a READ PAR (secret OCI_PAR_READ_URL,
+      # also ota-rpi/ prefix, public: it is the same token baked into
+      # OTA_PROD_MIRROR_BASE in api_server.py) so the device fetches the .raucb
+      # from the same mirror. The device reads latest-<channel>.json from that
+      # READ PAR when Cloudflare Pages is unreachable, before the rate-limited
+      # GitHub REST API fallback. Skips cleanly if the write secret is absent
+      # (GitHub Release + API still serve OTA git-only).
+      #
+      # PAR URL shape: https://objectstorage.<region>.oraclecloud.com/p/<token>/
+      # n/<ns>/b/<bucket>/o/  — an object named ota-rpi/<x> is PUT/GET at
+      # "<par>/ota-rpi/<x>" (both secrets stored WITH the trailing /o/; we strip
+      # it so a single "/o" remains before the object name).
+      - name: Mirror the bundle + manifest to Oracle Object Storage (PAR)
+        if: ${{ inputs.publish && inputs.sign }}
+        env:
+          # WRITE PAR (ota-rpi/ prefix) — the only secret; never in source.
+          PAR_WRITE: ${{ secrets.OCI_PAR_WRITE_URL }}
+          # READ PAR (ota-rpi/ prefix) — public (same token baked into
+          # OTA_PROD_MIRROR_BASE in api_server.py), so hardcoded here too.
+          PAR_READ: https://objectstorage.eu-milan-1.oraclecloud.com/p/_ARLDmSI67zHinw2p25J7xB0rcQQkbpOPlxJ0qnT5NRI1-mf7q7kWXzoapJ2GSwS/n/axdognj0blsq/b/bucket-osmiumsound-raspberry/o/
+          CH: ${{ steps.channel.outputs.channel }}
+          TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAR_WRITE:-}" ]; then
+            echo "::warning::Oracle write PAR secret not set — skipping the object-store mirror (GitHub Release + API still serve OTA)"
+            exit 0
+          fi
+          W="${PAR_WRITE%/}"   # .../o
+          R="${PAR_READ%/}"    # .../o
+          cd /mnt/rpi-out
+          for f in "osmium-rpi-$TAG.raucb" "osmium-rpi-$TAG.raucb.sha256"; do
+            curl --fail -sS -T "$f" "$W/ota-rpi/$TAG/$f"
+          done
+          # Rebuild the manifest with asset URLs on the public READ PAR.
+          OTA_ASSET_BASE="$R/ota-rpi/$TAG" \
+          EXTRA_ASSETS="osmium-rpi-$TAG.raucb osmium-rpi-$TAG.raucb.sha256" \
+            python3 "$GITHUB_WORKSPACE/.github/scripts/make-ota-manifest.py" \
+              "$TAG" "${{ github.repository }}" "$CH" "" "" ""
+          curl --fail -sS -H 'Content-Type: application/json' \
+            -T "manifest-out/latest-$CH.json" "$W/ota-rpi/latest-$CH.json"
+          echo "mirrored osmium-rpi-$TAG.raucb and latest-$CH.json to Oracle Object Storage (ota-rpi/)"

@@ -24,7 +24,7 @@ systemd-sysext add-ons, the Qt kiosk on eglfs/KMS).
 | Kernel | Debian `linux-image-amd64` (pinned) | downstream Raspberry `linux-image-rpi-v8` (Pi4) + `linux-image-rpi-2712` (Pi5), `raspi-firmware`, `rpi-eeprom`, apt-pinned |
 | RAUC backend | GRUB | `bootloader=custom` → `hifi-rpi-boot.sh` (arms tryboot / commits on mark-good) |
 | Disk image | `build-usb-image.sh` (ESP + slots) | `build-image-rpi.sh`: GPT 6 partitions (selector FAT, 2 boot FATs, 2 raw root slots, data) |
-| OTA | `osmium-sound.pages.dev` + `file.osmiumsound.it/ota` + `hifi-image-*.raucb` | `osmium-sound-raspberry.pages.dev` + `file.osmiumsound.it/ota-rpi` + `osmium-rpi-*.raucb` |
+| OTA | `osmium-sound.pages.dev` + `file.osmiumsound.it/ota` + `hifi-image-*.raucb` | GitHub Release + `gh-pages/ota` manifest + Oracle Object Storage (Milan) `ota-rpi/` mirror + `osmium-rpi-*.raucb` |
 | DSP binary | CamillaDSP `amd64` | CamillaDSP `aarch64` |
 
 The firmware auto-selects `kernel8.img` on a Pi4 (BCM2711) and `kernel_2712.img`

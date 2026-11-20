@@ -104,14 +104,24 @@ OTA_REPO = os.environ.get('HIFI_OTA_REPO', 'adri6412/osmium-sound-raspberry')
 # that fallback, then use the fast path again from then on.
 OTA_MANIFEST_BASE = os.environ.get('HIFI_OTA_MANIFEST_BASE',
                                    'https://osmium-sound-raspberry.pages.dev/ota')
-# Releases are served from file.osmiumsound.it (Cloudflare R2, the host the
-# ISO and the flasher come from) and the release workflow drops a copy of each
-# channel's manifest next to the payloads (ota/latest-<channel>.json). Read
-# that copy when Pages is unreachable, before resorting to the rate-limited
-# GitHub API. Stable releases since 2.5.24, every channel since 2.5.25; the
-# name stays for the HIFI_OTA_PROD_MIRROR_BASE override.
-OTA_PROD_MIRROR_BASE = os.environ.get('HIFI_OTA_PROD_MIRROR_BASE',
-                                      'https://file.osmiumsound.it/ota-rpi')
+# Releases are mirrored to Oracle Object Storage (Milan), the replacement for the
+# retired Cloudflare R2 mirror now that R2 is out of storage budget. The release
+# workflow drops a copy of each channel's manifest next to the payloads
+# (ota-rpi/latest-<channel>.json) and the .raucb under ota-rpi/<tag>/. Read that
+# copy when Pages is unreachable, before resorting to the rate-limited GitHub API.
+#
+# The URL carries a READ-only Pre-Authenticated Request token (/p/<token>/),
+# scoped to the ota-rpi/ prefix: the bucket is private, this token is what grants
+# anonymous GET on the mirror. It is deliberately public (shipped in every image)
+# and read-only, so it exposes nothing the GitHub Releases don't already. A
+# separate WRITE PAR (a CI-only secret) uploads; it is never in source. The PAR
+# has an expiry — when it lapses the device simply falls back to the GitHub API.
+# Override via HIFI_OTA_PROD_MIRROR_BASE.
+OTA_PROD_MIRROR_BASE = os.environ.get(
+    'HIFI_OTA_PROD_MIRROR_BASE',
+    'https://objectstorage.eu-milan-1.oraclecloud.com'
+    '/p/_ARLDmSI67zHinw2p25J7xB0rcQQkbpOPlxJ0qnT5NRI1-mf7q7kWXzoapJ2GSwS'
+    '/n/axdognj0blsq/b/bucket-osmiumsound-raspberry/o/ota-rpi')
 # OTA release channel: 'prod' tracks GitHub's /releases/latest (stable releases
 # only); 'dev' tracks the newest release including prereleases (vX.Y.Z-dev.N).
 # 'alpha' tracks the newest release of ANY kind, including private test tags cut
@@ -9483,7 +9493,7 @@ _RELEASE_DNS_TIMEOUT = 4
 
 def _fetch_pages_manifest(channel, base=None):
     """Read the channel's static manifest from GitHub Pages (or from `base`,
-    its file.osmiumsound.it mirror). Returns a release-
+    its Oracle Object Storage mirror). Returns a release-
     shaped dict ({tag_name, assets:[…]}) or None if unavailable/empty."""
     url = f'{base or OTA_MANIFEST_BASE}/latest-{channel}.json'
     req = urllib.request.Request(url, headers={'User-Agent': 'hifi-player-ota'})
@@ -9566,8 +9576,8 @@ def _fetch_release_chain(channel):
         except Exception:
             log.warning("Pages manifest fetch failed for channel %s; falling back to API", channel)
 
-    # 2. The copy of the manifest next to the payloads on
-    #    file.osmiumsound.it (same host the download comes from anyway).
+    # 2. The copy of the manifest next to the payloads on the Oracle Object
+    #    Storage mirror (same host the download comes from anyway).
     if mirror_host in reachable:
         try:
             release = _fetch_pages_manifest(channel, OTA_PROD_MIRROR_BASE)
@@ -9584,8 +9594,8 @@ def _fetch_release_chain(channel):
 def _fetch_release(channel):
     """Fetch the release to offer for the given channel.
 
-    Source order: the static GitHub Pages manifest, its mirror on
-    file.osmiumsound.it, then the GitHub REST API (_fetch_release_chain).
+    Source order: the static GitHub Pages manifest, its Oracle Object
+    Storage mirror, then the GitHub REST API (_fetch_release_chain).
     The result is cached briefly; a failure is cached briefly too, and while
     it stands — or when the fetch fails outright — the last good release is
     reused so a momentary blip doesn't surface as an error.
