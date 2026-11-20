@@ -1,4 +1,4 @@
-name: Build Osmium Raspberry Pi image (manual)
+name: Build Osmium Raspberry Pi image
 
 # Builds the Osmium Sound image for the Raspberry Pi 4 AND Pi 5 (one image, both
 # boards; full feature parity with x86 — bundled Lyrion, DSP, CD ripping, web
@@ -6,11 +6,16 @@ name: Build Osmium Raspberry Pi image (manual)
 # but there is no live ISO and no GRUB: the Pi boots through its firmware tryboot
 # A/B scheme (autoboot.txt + boot_partition), and the image is a RAUC A/B disk.
 #
-#   Actions -> "Build Osmium Raspberry Pi image (manual)" -> Run workflow
-#     • version : e.g. 2.5.26-dev.6-alpha3 (goes into IMAGE_VERSION / RAUC manifest)
-#     • suite   : Debian suite (default: trixie — Qt6 needs Debian 13)
-#     • sign    : sign the RAUC bundle with the repo secrets (default: true).
-#     • publish : cut a GitHub Release + mirror to Oracle Object Storage (needs sign).
+# Two ways to run it:
+#   • Push a *-alpha* tag (e.g. 2.5.26-dev.6-alpha11): the tag IS the version and
+#     the build is signed + published automatically — tag == release. This mirrors
+#     the x86 build-ui-ota.yml, which is likewise tag-triggered.
+#   • Actions -> "Build Osmium Raspberry Pi image" -> Run workflow, for test builds
+#     (e.g. an unsigned/unpublished spin, or a different suite):
+#       • version : e.g. 2.5.26-dev.6-alpha3 (goes into IMAGE_VERSION / RAUC manifest)
+#       • suite   : Debian suite (default: trixie — Qt6 needs Debian 13)
+#       • sign    : sign the RAUC bundle with the repo secrets (default: true).
+#       • publish : cut a GitHub Release + mirror to Oracle Object Storage (needs sign).
 #
 # Signing keys come from repository secrets, NEVER from the tree:
 #   RAUC_SIGNING_CERT / RAUC_SIGNING_KEY  the X.509 cert+key for the .raucb
@@ -26,6 +31,9 @@ name: Build Osmium Raspberry Pi image (manual)
 # the API fallback); the Oracle mirror just adds a non-rate-limited CDN path.
 
 on:
+  push:
+    tags:
+      - '*-alpha*'
   workflow_dispatch:
     inputs:
       version:
@@ -54,6 +62,48 @@ permissions:
   contents: write
 
 jobs:
+  # Resolve the build parameters from whichever trigger fired. A manual dispatch
+  # carries them as inputs; a pushed *-alpha* tag means "release this tag", so the
+  # tag name becomes the version and the build is signed + published. Downstream
+  # jobs read needs.setup.outputs.* instead of inputs.* (empty on a tag push).
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.p.outputs.version }}
+      suite: ${{ steps.p.outputs.suite }}
+      sign: ${{ steps.p.outputs.sign }}
+      publish: ${{ steps.p.outputs.publish }}
+    steps:
+      - id: p
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_SUITE: ${{ inputs.suite }}
+          IN_SIGN: ${{ inputs.sign }}
+          IN_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -eu
+          if [ "$EVENT" = "push" ]; then
+            # Tag push == release: version is the tag, always signed + published.
+            version=$REF_NAME
+            suite=trixie
+            sign=true
+            publish=true
+          else
+            version=$IN_VERSION
+            suite=${IN_SUITE:-trixie}
+            sign=$IN_SIGN
+            publish=$IN_PUBLISH
+          fi
+          {
+            echo "version=$version"
+            echo "suite=$suite"
+            echo "sign=$sign"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::build params — version=$version suite=$suite sign=$sign publish=$publish (event=$EVENT)"
+
   # 🚨 On the bare arm64 runner, not in a container: build-payload.sh builds the
   # Qt interface natively inside a `debian:trixie` docker container, which on an
   # arm64 runner is arm64 — a real aarch64 build, no qemu. It cannot run inside
@@ -123,7 +173,7 @@ jobs:
   # runner, so debootstrap/mksquashfs/losetup/rauc all run native arm64.
   image:
     runs-on: ubuntu-24.04-arm
-    needs: [qt-payload, np-payload]
+    needs: [setup, qt-payload, np-payload]
     timeout-minutes: 180
     defaults:
       run:
@@ -199,7 +249,7 @@ jobs:
       - name: Work out the OTA channel from the version
         id: channel
         env:
-          V: ${{ inputs.version }}
+          V: ${{ needs.setup.outputs.version }}
         run: |
           set -eu
           case "$V" in
@@ -212,9 +262,9 @@ jobs:
 
       - name: Build the Raspberry Pi system image (+ RAUC bundle)
         env:
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_SUITE: ${{ inputs.suite }}
-          INPUT_SIGN: ${{ inputs.sign }}
+          INPUT_VERSION: ${{ needs.setup.outputs.version }}
+          INPUT_SUITE: ${{ needs.setup.outputs.suite }}
+          INPUT_SIGN: ${{ needs.setup.outputs.sign }}
           RAUC_SIGNING_CERT: ${{ secrets.RAUC_SIGNING_CERT }}
           RAUC_SIGNING_KEY: ${{ secrets.RAUC_SIGNING_KEY }}
         run: |
@@ -248,7 +298,7 @@ jobs:
 
       - name: Assemble the flashable SD/USB image
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ needs.setup.outputs.version }}
         run: |
           set -euo pipefail
           SQ="/mnt/rpi-out/osmium-rpi-${INPUT_VERSION}.rootfs.squashfs"
@@ -262,8 +312,8 @@ jobs:
       - name: Checksum + sign the artifacts
         env:
           OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_SIGN: ${{ inputs.sign }}
+          INPUT_VERSION: ${{ needs.setup.outputs.version }}
+          INPUT_SIGN: ${{ needs.setup.outputs.sign }}
         run: |
           set -euo pipefail
           cd /mnt/rpi-out
@@ -290,7 +340,7 @@ jobs:
       - name: Upload the RAUC bundle
         uses: actions/upload-artifact@v4
         with:
-          name: osmium-rpi-raucb-${{ inputs.version }}
+          name: osmium-rpi-raucb-${{ needs.setup.outputs.version }}
           path: |
             /mnt/rpi-out/osmium-rpi-*.raucb*
             /mnt/rpi-out/osmium-rpi-*.info.txt
@@ -301,7 +351,7 @@ jobs:
       - name: Upload the flashable disk image
         uses: actions/upload-artifact@v4
         with:
-          name: osmium-rpi-img-${{ inputs.version }}
+          name: osmium-rpi-img-${{ needs.setup.outputs.version }}
           path: /mnt/rpi-out/osmium-rpi-*.img.xz*
           retention-days: 14
           if-no-files-found: error
@@ -311,26 +361,26 @@ jobs:
       # only when the operator ticks `publish` AND `sign`, so no tag is cut on a
       # plain build.
       - name: Publish GitHub Release (OTA)
-        if: ${{ inputs.publish && inputs.sign }}
+        if: ${{ needs.setup.outputs.publish == 'true' && needs.setup.outputs.sign == 'true' }}
         uses: softprops/action-gh-release@v2.2.1
         with:
-          tag_name: ${{ inputs.version }}
+          tag_name: ${{ needs.setup.outputs.version }}
           # Tag the commit this image was actually built from, NOT the default
           # branch. Without this the tag lands on main (an older commit), GitHub
           # dates the release by that commit and orders it below newer alphas,
           # so the device's GitHub-API fallback never offers it.
           target_commitish: ${{ github.sha }}
-          name: ${{ inputs.version }}
-          body: "Osmium Sound image ${{ inputs.version }} for Raspberry Pi 4 & Pi 5 (RAUC A/B bundle for OTA, plus the flashable SD/USB image)."
+          name: ${{ needs.setup.outputs.version }}
+          body: "Osmium Sound image ${{ needs.setup.outputs.version }} for Raspberry Pi 4 & Pi 5 (RAUC A/B bundle for OTA, plus the flashable SD/USB image)."
           prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
           make_latest: ${{ steps.channel.outputs.channel == 'prod' }}
           fail_on_unmatched_files: true
           files: |
-            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.raucb
-            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.raucb.sha256
-            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.img.xz
-            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.img.xz.sha256
-            /mnt/rpi-out/osmium-rpi-${{ inputs.version }}.info.txt
+            /mnt/rpi-out/osmium-rpi-${{ needs.setup.outputs.version }}.raucb
+            /mnt/rpi-out/osmium-rpi-${{ needs.setup.outputs.version }}.raucb.sha256
+            /mnt/rpi-out/osmium-rpi-${{ needs.setup.outputs.version }}.img.xz
+            /mnt/rpi-out/osmium-rpi-${{ needs.setup.outputs.version }}.img.xz.sha256
+            /mnt/rpi-out/osmium-rpi-${{ needs.setup.outputs.version }}.info.txt
 
       # OTA delivery is Oracle Object Storage (Milan) as the single manifest
       # source, with the GitHub REST API as the safety-net fallback. The old
@@ -352,7 +402,7 @@ jobs:
       # "<par>/ota-rpi/<x>" (both secrets stored WITH the trailing /o/; we strip
       # it so a single "/o" remains before the object name).
       - name: Mirror the bundle + manifest to Oracle Object Storage (PAR)
-        if: ${{ inputs.publish && inputs.sign }}
+        if: ${{ needs.setup.outputs.publish == 'true' && needs.setup.outputs.sign == 'true' }}
         env:
           # WRITE PAR (ota-rpi/ prefix) — the only secret; never in source.
           PAR_WRITE: ${{ secrets.OCI_PAR_WRITE_URL }}
@@ -360,7 +410,7 @@ jobs:
           # OTA_PROD_MIRROR_BASE in api_server.py), so hardcoded here too.
           PAR_READ: https://objectstorage.eu-milan-1.oraclecloud.com/p/_ARLDmSI67zHinw2p25J7xB0rcQQkbpOPlxJ0qnT5NRI1-mf7q7kWXzoapJ2GSwS/n/axdognj0blsq/b/bucket-osmiumsound-raspberry/o/
           CH: ${{ steps.channel.outputs.channel }}
-          TAG: ${{ inputs.version }}
+          TAG: ${{ needs.setup.outputs.version }}
         run: |
           set -euo pipefail
           if [ -z "${PAR_WRITE:-}" ]; then
