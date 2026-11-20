@@ -1,0 +1,18 @@
+[Unit]
+Description=Osmium Sound — stage the Qt on-screen UI payload in RAM
+# Populate /run/hifi-qt before the kiosk starts; it runs its binary from there
+# (see hifi-qt.service.d/10-ram.conf). local-fs so /opt (squashfs) is mounted.
+DefaultDependencies=no
+After=local-fs.target
+Before=hifi-qt.service
+ConditionPathExists=/opt/hifi-qt/hifi-qt
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/hifi-qt-ram.sh
+# Tear the staging mount down on stop so a stale copy never lingers.
+ExecStop=/bin/sh -c 'umount /run/hifi-qt 2>/dev/null || true'
+
+[Install]
+WantedBy=hifi-qt.service
