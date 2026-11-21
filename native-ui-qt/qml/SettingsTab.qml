@@ -3010,10 +3010,12 @@ Item {
         // and reboot. Choosing the board already in use does nothing.
         case "hat_pick": {
             if (arg === cfg.dacHatCur) break
-            Ui.dialogs.confirm(Tr.t("settings.audio.hat.rebootPrompt"), Tr.t("settings.controls.reboot"), false, function(ok) {
-                if (!ok) return
-                post(A("/set_dac_hat"), { id: arg }, function(d) {
-                    if (d && d.success) { cfg.dacHatCur = arg; post(A("/reboot"), {}); say(Tr.t("settings.msg.rebooting")) }
+            Ui.dialogs.confirm(Tr.t("settings.audio.hat.rebootPrompt"), Tr.t("settings.controls.reboot"), false, function(go) {
+                if (!go) return
+                // post()'s callback is (ok, data, status) — the first arg is the
+                // HTTP-ok flag, not the body, so read success off the 2nd arg.
+                post(A("/set_dac_hat"), { id: arg }, function(ok, d) {
+                    if (ok && d && d.success) { cfg.dacHatCur = arg; post(A("/reboot"), {}); say(Tr.t("settings.msg.rebooting")) }
                     else say(Tr.t("settings.audio.hat.setFailed"))
                 })
             })
