@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""Keep only the newest OTA release of each channel on file.osmiumsound.it.
+"""Keep only the newest OTA release of each channel on the Oracle OTA mirror.
 
-Every release, stable or not, is uploaded to the R2 bucket behind
-file.osmiumsound.it as ``ota/<tag>/<asset>`` (see build-ui-ota.yml), and the
-manifests the devices read point there. Nothing ever needs an older one: a
-device only ever installs the release its channel's manifest names, so every
-``ota/<tag>/`` folder that no channel names any more is dead weight — about a
-gigabyte each, against a 10 GB free tier.
+Every Raspberry image, stable or not, is uploaded to the Oracle Object Storage
+bucket (Milan, prefix ``ota-rpi/``) as ``ota-rpi/<tag>/<asset>`` and the per
+channel manifests the devices read — ``ota-rpi/latest-<channel>.json`` — point
+there (see build-rpi-image.yml). A device only ever installs the release its
+channel's manifest names, so every ``ota-rpi/<tag>/`` folder that no channel
+names any more is dead weight (a .raucb bundle is ~670 MB).
+
+This is the Raspberry twin of prune-ota-r2.py: same logic, but the mirror is
+Oracle (reached through its S3-compatible API with boto3), the prefix is
+``ota-rpi/`` and the Pi tags carry no leading ``v`` (e.g. 2.5.26-dev.6-alpha14).
+The authoritative "what each channel points at" is the manifest in the bucket
+itself — the Pi has no gh-pages / Pages manifest.
 
 Usage:
-    prune-ota-r2.py [--channel-tag CH=TAG ...] [--keep TAG ...]
-                    [--grace-hours N] [--dry-run]
+    prune-ota-oracle.py [--keep TAG ...] [--grace-hours N] [--dry-run]
 
 What stays:
-  * the tag named by each channel's manifest: ``--channel-tag`` (the workflow
-    passes what gh-pages, i.e. the Pages manifest the devices read first,
-    says) plus ``ota/latest-<channel>.json`` in the bucket, the mirror the
-    devices read when Pages is down. Both, when they disagree: a device may be
-    reading either one;
+  * the tag named by each channel's manifest ``ota-rpi/latest-<channel>.json``;
   * every ``--keep`` tag (the release being published right now);
-  * any folder written in the last ``--grace-hours`` hours: a release of
-    another channel may be uploading at this very moment, and its manifest
-    does not name it yet.
+  * any folder written in the last ``--grace-hours`` hours: another channel may
+    be uploading at this very moment and its manifest does not name it yet.
 
-If a channel's tag cannot be found in either place, nothing is deleted: not
-knowing what a channel points at is no reason to take its files away.
+If a channel's manifest cannot be read, nothing is deleted: not knowing what a
+channel points at is no reason to take its files away.
 
-Environment: R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+Environment: OCI_S3_ENDPOINT, OCI_S3_REGION, OCI_S3_BUCKET, OTA_PREFIX,
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 """
 import argparse
 import datetime
@@ -36,18 +37,25 @@ import re
 import sys
 
 CHANNELS = ('prod', 'dev', 'alpha')
-# Release tags only (v2.5.24, v2.5.25-dev.3-alpha2, …): whatever else may one
-# day live under ota/ is not this script's business.
-TAG_RE = re.compile(r'^v\d+\.\d+\.\d+[0-9A-Za-z.-]*$')
+# Release tags only, WITHOUT a leading "v" (2.5.26, 2.5.26-dev.6-alpha14, …):
+# the Raspberry fork tags and its ota-rpi/<tag>/ folders have no "v".
+TAG_RE = re.compile(r'^\d+\.\d+\.\d+[0-9A-Za-z.-]*$')
+
+
+def _prefix():
+    p = os.environ.get('OTA_PREFIX', 'ota-rpi/')
+    return p if p.endswith('/') else p + '/'
 
 
 def group_by_tag(objects):
-    """{tag: [objects]} for the keys shaped ota/<tag>/<file>."""
+    """{tag: [objects]} for the keys shaped <prefix><tag>/<file>."""
+    pfx = _prefix()
     out = {}
     for o in objects:
-        parts = o['Key'].split('/')
-        if len(parts) >= 3 and parts[0] == 'ota' and TAG_RE.match(parts[1]):
-            out.setdefault(parts[1], []).append(o)
+        rest = o['Key'][len(pfx):] if o['Key'].startswith(pfx) else ''
+        parts = rest.split('/')
+        if len(parts) >= 2 and TAG_RE.match(parts[0]) and parts[1]:
+            out.setdefault(parts[0], []).append(o)
     return out
 
 
@@ -66,13 +74,14 @@ def plan(objects, keep, grace_hours, now):
 
 
 def mirror_tags(s3, bucket):
-    """{channel: tag} from the ota/latest-<channel>.json mirrors in the bucket."""
+    """{channel: tag} from the <prefix>latest-<channel>.json manifests."""
+    pfx = _prefix()
     out = {}
     for ch in CHANNELS:
         try:
-            body = s3.get_object(Bucket=bucket, Key=f'ota/latest-{ch}.json')['Body'].read()
+            body = s3.get_object(Bucket=bucket, Key=f'{pfx}latest-{ch}.json')['Body'].read()
             tag = json.loads(body).get('tag_name') or ''
-        except Exception as e:  # missing mirror, or unreadable
+        except Exception as e:  # missing manifest, or unreadable
             if 'NoSuchKey' not in repr(e) and '404' not in repr(e):
                 raise
             continue
@@ -83,7 +92,7 @@ def mirror_tags(s3, bucket):
 
 def list_ota(s3, bucket):
     objs = []
-    for page in s3.get_paginator('list_objects_v2').paginate(Bucket=bucket, Prefix='ota/'):
+    for page in s3.get_paginator('list_objects_v2').paginate(Bucket=bucket, Prefix=_prefix()):
         objs.extend(page.get('Contents', []))
     return objs
 
@@ -97,23 +106,24 @@ def summary(lines):
 
 def main(argv=None, s3=None, now=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument('--channel-tag', action='append', default=[], metavar='CH=TAG')
     ap.add_argument('--keep', action='append', default=[], metavar='TAG')
     ap.add_argument('--grace-hours', type=float, default=3)
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
 
-    bucket = os.environ.get('R2_BUCKET', 'osmium-sound-iso-beta')
+    bucket = os.environ.get('OCI_S3_BUCKET', 'bucket-osmiumsound-raspberry')
     if s3 is None:
         import boto3
-        s3 = boto3.client('s3', endpoint_url=os.environ['R2_ENDPOINT'], region_name='auto')
+        from botocore.config import Config
+        s3 = boto3.client(
+            's3',
+            endpoint_url=os.environ['OCI_S3_ENDPOINT'],
+            region_name=os.environ.get('OCI_S3_REGION', 'eu-milan-1'),
+            # Oracle's S3-compatible endpoint wants path-style addressing.
+            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
     now = now or datetime.datetime.now(datetime.timezone.utc)
 
     named = {ch: set() for ch in CHANNELS}
-    for kv in args.channel_tag:
-        ch, _, tag = kv.partition('=')
-        if ch in named and tag:
-            named[ch].add(tag)
     for ch, tag in mirror_tags(s3, bucket).items():
         named[ch].add(tag)
     unknown = [ch for ch in CHANNELS if not named[ch]]
@@ -125,7 +135,8 @@ def main(argv=None, s3=None, now=None):
     keep = set(args.keep).union(*named.values())
     delete, recent = plan(list_ota(s3, bucket), keep, args.grace_hours, now)
 
-    lines = ['### OTA releases on file.osmiumsound.it', '']
+    pfx = _prefix()
+    lines = ['### OTA releases on the Oracle mirror (ota-rpi/)', '']
     for ch in CHANNELS:
         lines.append(f"- {ch}: {', '.join(sorted(named[ch]))}")
     for tag in recent:
@@ -139,7 +150,7 @@ def main(argv=None, s3=None, now=None):
             res = s3.delete_objects(Bucket=bucket, Delete={
                 'Objects': [{'Key': k} for k in keys[i:i + 1000]], 'Quiet': True})
             if res.get('Errors'):
-                print(f"::error::deleting ota/{tag}/ failed: {res['Errors'][:3]}")
+                print(f"::error::deleting {pfx}{tag}/ failed: {res['Errors'][:3]}")
                 return 1
     if not delete:
         lines.append('- nothing to delete')

@@ -1,0 +1,72 @@
+name: Keep only the newest OTA release of each channel on the Oracle mirror
+
+# Every Raspberry image is uploaded to Oracle Object Storage (Milan) as
+# ota-rpi/<tag>/ (see build-rpi-image.yml) and the devices download the release
+# their channel manifest (ota-rpi/latest-<channel>.json) names; only that one is
+# ever fetched, so every other ota-rpi/<tag>/ folder is dead weight — a .raucb
+# is ~670 MB (.github/scripts/prune-ota-oracle.py says what stays and why).
+#
+# The Raspberry twin of prune-ota-r2.yml. The mirror is reached through Oracle's
+# S3-compatible API with boto3, so it needs a Customer Secret Key — two repo
+# secrets, OCI_S3_ACCESS_KEY_ID and OCI_S3_SECRET_ACCESS_KEY (the WRITE PAR the
+# build uses cannot list or delete). Endpoint, region and bucket are not secret
+# (the public READ PAR already carries them) so they are defaulted here. With no
+# key set the job skips cleanly — the release is never blocked by the prune.
+#
+# Called by build-rpi-image.yml once a release is published. The schedule and
+# the manual run only work once this file is on the default branch (GitHub reads
+# those triggers from there).
+
+on:
+  workflow_call:
+    inputs:
+      keep:
+        description: 'Tag to keep whatever the manifests say (the release being published)'
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only list what would be deleted'
+        type: boolean
+        default: true
+  schedule:
+    - cron: '23 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ota-oracle-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Delete the releases no channel names any more
+        env:
+          KEEP: ${{ inputs.keep }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.OCI_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OCI_S3_SECRET_ACCESS_KEY }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          # Not secret — the public READ PAR in build-rpi-image.yml already
+          # exposes namespace, region and bucket.
+          OCI_S3_ENDPOINT: https://axdognj0blsq.compat.objectstorage.eu-milan-1.oraclecloud.com
+          OCI_S3_REGION: eu-milan-1
+          OCI_S3_BUCKET: bucket-osmiumsound-raspberry
+          OTA_PREFIX: ota-rpi/
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "::warning::Oracle S3 secrets (OCI_S3_ACCESS_KEY_ID / OCI_S3_SECRET_ACCESS_KEY) are not set — skipping the OTA prune"
+            exit 0
+          fi
+          python3 -m pip install --quiet boto3
+          set --
+          [ -n "${KEEP:-}" ] && set -- "$@" --keep "$KEEP"
+          # shellcheck disable=SC2086  # empty or one flag
+          python3 .github/scripts/prune-ota-oracle.py "$@" $DRY_RUN

@@ -431,3 +431,16 @@ jobs:
           curl --fail -sS -H 'Content-Type: application/json' \
             -T "manifest-out/latest-$CH.json" "$W/ota-rpi/latest-$CH.json"
           echo "mirrored osmium-rpi-$TAG.raucb and latest-$CH.json to Oracle Object Storage (ota-rpi/)"
+
+  # Once the release is on the Oracle mirror, drop the ota-rpi/<tag>/ folders no
+  # channel manifest names any more, so only the current release of each channel
+  # (prod/dev/alpha) is kept — the Raspberry twin of x86's prune-ota-r2 call.
+  # Non-fatal: it skips cleanly if the S3 secrets are unset (see the reusable
+  # workflow). It also runs nightly on its own from the default branch.
+  prune-ota:
+    needs: [setup, image]
+    if: ${{ needs.setup.outputs.publish == 'true' && needs.setup.outputs.sign == 'true' }}
+    uses: ./.github/workflows/prune-ota-oracle.yml
+    with:
+      keep: ${{ needs.setup.outputs.version }}
+    secrets: inherit
