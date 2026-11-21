@@ -2419,6 +2419,186 @@ def set_mixer_switch(name, on):
     return {'success': True, 'switches': switches or [],
             'message': _t('audio.mixerSwitchSet', _lang())}
 
+# ── Settings → Audio: I2S HAT / DAC board selection (Raspberry Pi only) ────
+# An I2S HAT (HiFiBerry, Allo, IQaudio, JustBoom, Audiophonics…) is NOT an ALSA
+# card until its device-tree overlay is loaded at boot. We therefore do NOT touch
+# squeezelite here (that is the runtime OUTPUT picker, set_audio_device, which only
+# sees cards that already exist). Instead we persist the chosen card and write its
+# `dtoverlay=` line into the boot config.txt, which takes effect on the next reboot;
+# once rebooted, the HAT shows up as a card and becomes selectable as the output.
+#
+# The card catalogue ships in the rootfs (derived from moOde's cfg_audiodev). The
+# choice is saved to DAC_HAT_FILE on the shared /data /etc overlay, so it survives
+# OTA: hifi-rpi-bootfat.sh re-injects it every time it regenerates the boot FAT.
+# hifi-rpi-dacoverlay.sh is the single renderer used by both paths.
+DAC_HAT_FILE = '/etc/hifi-player/dac-hat.conf'
+DAC_CARDS_FILE = '/usr/local/share/hifi-ab/rpi-boot/dac-cards.json'
+DAC_OVERLAY_SCRIPT = '/usr/local/sbin/hifi-rpi-dacoverlay.sh'
+DAC_BOOT_PARTLABELS = ('hifi-boot-a', 'hifi-boot-b')
+
+def _is_rpi():
+    """True on a Raspberry Pi (Pi 4/5, CM4/CM5). The x86 build has no config.txt
+    and no I2S HATs, so the whole feature is gated off there."""
+    try:
+        with open('/proc/device-tree/model', 'rb') as f:
+            return b'Raspberry Pi' in f.read()
+    except OSError:
+        return False
+
+_dac_cards_cache = None
+def _load_dac_cards():
+    """Return the list of I2S HAT cards from the shipped catalogue (cached).
+    Each entry: {id, name, dacchip, overlay, overlay_params}. Empty on error."""
+    global _dac_cards_cache
+    if _dac_cards_cache is not None:
+        return _dac_cards_cache
+    cards = []
+    try:
+        with open(DAC_CARDS_FILE, encoding='utf-8') as f:
+            doc = json.load(f)
+        for c in doc.get('cards', []):
+            if c.get('iface') != 'I2S' or not c.get('overlay'):
+                continue
+            cards.append({
+                'id': str(c.get('id', '')),
+                'name': str(c.get('name', '')),
+                'dacchip': str(c.get('dacchip', '')),
+                'overlay': str(c.get('overlay', '')),
+                'overlay_params': str(c.get('overlay_params', '')),
+            })
+    except Exception:
+        log.exception("failed to load DAC card catalogue %s", DAC_CARDS_FILE)
+    _dac_cards_cache = cards
+    return cards
+
+def _dac_overlay_value(card):
+    """The dtoverlay payload for a card: overlay[,params]."""
+    ov = card['overlay']
+    if card.get('overlay_params'):
+        ov = ov + ',' + card['overlay_params']
+    return ov
+
+def _read_dac_hat():
+    """Return {'id': <card id or ''>, 'overlay': <payload or ''>} from the saved
+    conf (key=value lines). Absent file = no HAT."""
+    cur = {'id': '', 'overlay': ''}
+    try:
+        with open(DAC_HAT_FILE, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('id='):
+                    cur['id'] = line[3:]
+                elif line.startswith('overlay='):
+                    cur['overlay'] = line[8:]
+    except OSError:
+        pass
+    return cur
+
+def list_dac_hats():
+    """Catalogue + current selection for the Settings UI. On non-Pi hardware,
+    `supported` is False and the UI hides the section."""
+    if not _is_rpi():
+        return {'supported': False, 'cards': [], 'current': ''}
+    return {'supported': True,
+            'cards': _load_dac_cards(),
+            'current': _read_dac_hat()['id']}
+
+def set_dac_hat(card_id):
+    """Persist the chosen I2S HAT and write its overlay into both boot FATs'
+    config.txt. Takes effect on reboot. card_id '' / 'none' clears the HAT."""
+    if not _is_rpi():
+        return {'success': False, 'code': 'dac.notSupported',
+                'message': 'I2S HAT selection is only available on Raspberry Pi.'}
+    if _update_in_progress():
+        return {'success': False, 'code': 'dac.updateBusy',
+                'message': 'An update is in progress; try again after it finishes.'}
+
+    card_id = (card_id or '').strip()
+    if card_id in ('', 'none'):
+        card, overlay = None, ''
+    else:
+        card = next((c for c in _load_dac_cards() if c['id'] == card_id), None)
+        if card is None:
+            return {'success': False, 'code': 'dac.invalidCard',
+                    'message': 'Unknown DAC/HAT: %s' % card_id}
+        overlay = _dac_overlay_value(card)
+
+    # Persist first (survives OTA); then patch the live boot FATs for next boot.
+    conf = 'id=%s\noverlay=%s\n' % (card_id if card else '', overlay)
+    try:
+        os.makedirs(os.path.dirname(DAC_HAT_FILE), exist_ok=True)
+        _write_file_atomic(DAC_HAT_FILE, conf)
+    except OSError:
+        log.exception("set_dac_hat: failed to save %s", DAC_HAT_FILE)
+        return {'success': False, 'code': 'dac.saveFailed',
+                'message': 'Could not save the DAC selection.'}
+
+    patched, failed = _apply_dac_overlay_to_boot_fats(overlay)
+    if not patched:
+        return {'success': False, 'code': 'dac.applyFailed',
+                'message': 'Saved, but no boot partition could be updated: %s'
+                           % ', '.join(failed)}
+    msg = ('HAT set to %s — reboot to apply.' % card['name']) if card \
+        else 'I2S HAT disabled — reboot to apply.'
+    return {'success': True, 'reboot_required': True, 'current': card_id if card else '',
+            'message': msg, 'warnings': failed}
+
+def _apply_dac_overlay_to_boot_fats(overlay):
+    """Render `overlay` into config.txt on every boot FAT (A and B), so the choice
+    is consistent across an A/B switch. Returns (patched_labels, failed_labels).
+    Each FAT is mounted read-write only if not already mounted; we only unmount
+    what we mounted."""
+    import tempfile
+    patched, failed = [], []
+    mounts = {}
+    try:
+        with open('/proc/mounts', encoding='utf-8') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    mounts[os.path.realpath(parts[0])] = parts[1]
+    except OSError:
+        pass
+    for label in DAC_BOOT_PARTLABELS:
+        dev = '/dev/disk/by-partlabel/' + label
+        try:
+            rdev = os.path.realpath(dev)
+        except OSError:
+            rdev = dev
+        if not os.path.exists(dev):
+            failed.append(label + ' (absent)')
+            continue
+        mp = mounts.get(rdev)
+        own_mount = None
+        try:
+            if mp is None:
+                own_mount = tempfile.mkdtemp(prefix='hifi-bootfat-')
+                subprocess.run(['mount', dev, own_mount], check=True,
+                               capture_output=True)
+                mp = own_mount
+            cfg = os.path.join(mp, 'config.txt')
+            if not os.path.isfile(cfg):
+                failed.append(label + ' (no config.txt)')
+                continue
+            subprocess.run(['sh', DAC_OVERLAY_SCRIPT, cfg, overlay], check=True,
+                           capture_output=True)
+            patched.append(label)
+        except Exception as e:
+            log.exception("set_dac_hat: patching %s failed", label)
+            failed.append('%s (%s)' % (label, e))
+        finally:
+            if own_mount is not None:
+                try:
+                    subprocess.run(['umount', own_mount], check=False,
+                                   capture_output=True)
+                except Exception:
+                    pass
+                try:
+                    os.rmdir(own_mount)
+                except OSError:
+                    pass
+    return patched, failed
+
 # ── Settings → Audio: the rest of the squeezelite model ────────────
 # The fields in hifi_squeezelite.TUNABLE (DSD mode, switching pause, rate
 # limit, hardware volume, buffers, real-time priority, extra arguments) —
@@ -11519,6 +11699,15 @@ def api_audio_devices():
 def api_set_audio_device():
     data = request.get_json(silent=True) or {}
     return jsonify(set_audio_device(data.get('device')))
+
+@app.route('/dac_hats', methods=['GET'])
+def api_dac_hats():
+    return jsonify(list_dac_hats())
+
+@app.route('/set_dac_hat', methods=['POST'])
+def api_set_dac_hat():
+    data = request.get_json(silent=True) or {}
+    return jsonify(set_dac_hat(data.get('id')))
 
 @app.route('/set_mixer_switch', methods=['POST'])
 def api_set_mixer_switch():

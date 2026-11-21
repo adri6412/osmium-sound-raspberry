@@ -65,9 +65,13 @@ initramfs initramfs_2712 followkernel
 
 [all]
 # On-board analogue/HDMI audio off: this is a source for USB/I2S DACs. A USB DAC
-# needs no overlay; for an I2S HAT, uncomment exactly one line below.
+# needs no overlay; an I2S HAT needs exactly one `dtoverlay=` line.
 dtparam=audio=off
-#dtoverlay=hifiberry-dacplus
-#dtoverlay=allo-boss-dac-pcm512x-audio
-#dtoverlay=iqaudio-dacplus
+# The chosen I2S HAT overlay is injected BETWEEN the two markers below (which must
+# stay EXACTLY "# >>> osmium-dac" / "# <<< osmium-dac"), both when the boot FAT is
+# (re)generated (hifi-rpi-bootfat.sh, on every OTA) and when the user picks a card
+# at runtime (api_server /set_dac_hat). Empty block = no HAT (USB/HDMI only).
+# hifi-rpi-dacoverlay.sh is the single renderer for both paths; do NOT edit inside.
+# >>> osmium-dac
+# <<< osmium-dac
 # The Pi has no hardware RTC; NTP (systemd-timesyncd) sets the clock at boot.

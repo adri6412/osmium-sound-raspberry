@@ -1444,7 +1444,16 @@
       "unavailable": "Audio device list not available.",
       "defaultDevice": "System default",
       "updated": "Audio output updated.",
-      "setFailed": "Setting failed."
+      "setFailed": "Setting failed.",
+      "hat": {
+        "title": "I2S DAC / HAT board",
+        "help": "Select the HiFi DAC board (HAT) plugged onto the Pi's GPIO header. This loads the board's driver at boot; after the reboot it appears above as a playback output. A USB or HDMI DAC needs nothing here.",
+        "none": "No HAT (USB / HDMI only)",
+        "apply": "Apply (reboot)",
+        "rebootPrompt": "The DAC board is applied on reboot. Reboot now?",
+        "saved": "Saved — reboot to apply.",
+        "setFailed": "Could not apply the DAC board."
+      }
     },
     "network": {
       "interfaceLabel": "Network Interface",

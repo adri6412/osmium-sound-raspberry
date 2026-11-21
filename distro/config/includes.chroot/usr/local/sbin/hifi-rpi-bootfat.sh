@@ -85,6 +85,26 @@ ls "$FAT"/bcm2712-*.dtb >/dev/null 2>&1 || die "no Pi 5 (bcm2712-*) DTB landed o
 
 # ── config.txt (shared) + cmdline.txt (per slot) ──────────────────────────
 cp -f "$RPI_BOOT_DIR/config.txt" "$FAT/config.txt"
+
+# Re-inject the user-chosen I2S HAT overlay into the freshly copied config.txt,
+# so the choice survives this regeneration (factory build AND every OTA). The
+# choice lives on the shared /data overlay at /etc/hifi-player/dac-hat.conf
+# (key=value lines; the `overlay=` line holds the dtoverlay payload). It is read
+# from the LIVE /etc (same for both A/B slots), not from the read-only squashfs
+# $SQ, whose /etc has no overlay upper layer. Absent (factory build) = no HAT.
+DAC_HAT_CONF="${DAC_HAT_CONF:-/etc/hifi-player/dac-hat.conf}"
+DAC_RENDER="$SQ/usr/local/sbin/hifi-rpi-dacoverlay.sh"
+_dac_overlay=""
+if [ -f "$DAC_HAT_CONF" ]; then
+    _dac_overlay=$(sed -n 's/^overlay=//p' "$DAC_HAT_CONF" | head -n 1)
+fi
+if [ -x "$DAC_RENDER" ]; then
+    sh "$DAC_RENDER" "$FAT/config.txt" "$_dac_overlay" \
+        || die "failed to render the DAC overlay into config.txt"
+else
+    log "WARN: $DAC_RENDER missing; config.txt has no HAT overlay injected"
+fi
+
 sed -e "s|@ROOT_PARTUUID@|$ROOT_PARTUUID|g" -e "s|@SLOT@|$SLOT|g" \
     "$RPI_BOOT_DIR/cmdline.txt.tmpl" > "$FAT/cmdline.txt"
 sync

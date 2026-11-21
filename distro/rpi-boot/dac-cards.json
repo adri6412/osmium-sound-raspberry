@@ -1,0 +1,549 @@
+{
+  "_source": "moode-player/moode (GPL) var/local/www/db/moode-sqlite3.db.sql cfg_audiodev",
+  "cards": [
+    {
+      "id": "allo-boss-2-dac",
+      "name": "Allo Boss 2 DAC",
+      "dacchip": "Cirrus Logic CS43198",
+      "iface": "I2S",
+      "overlay": "allo-boss2-dac-audio",
+      "overlay_params": ""
+    },
+    {
+      "id": "allo-boss-dac",
+      "name": "Allo Boss DAC",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "allo-boss-dac-pcm512x-audio",
+      "overlay_params": "slave"
+    },
+    {
+      "id": "allo-digione",
+      "name": "Allo DigiOne",
+      "dacchip": "Cirrus Logic WM8805",
+      "iface": "I2S",
+      "overlay": "allo-digione",
+      "overlay_params": ""
+    },
+    {
+      "id": "allo-digione-signature",
+      "name": "Allo DigiOne Signature",
+      "dacchip": "Cirrus Logic WM8805",
+      "iface": "I2S",
+      "overlay": "allo-digione",
+      "overlay_params": ""
+    },
+    {
+      "id": "allo-katana-dac",
+      "name": "Allo Katana DAC",
+      "dacchip": "ESS Sabre ES9038Q2M",
+      "iface": "I2S",
+      "overlay": "allo-katana-dac-audio",
+      "overlay_params": ""
+    },
+    {
+      "id": "allo-miniboss-dac",
+      "name": "Allo MiniBoss DAC",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "allo-boss-dac-pcm512x-audio",
+      "overlay_params": "slave"
+    },
+    {
+      "id": "allo-piano-2-1-hi-fi-dac",
+      "name": "Allo Piano 2.1 Hi-Fi DAC",
+      "dacchip": "Burr Brown PCM5142",
+      "iface": "I2S",
+      "overlay": "allo-piano-dac-plus-pcm512x-audio",
+      "overlay_params": "glb_mclk"
+    },
+    {
+      "id": "allo-piano-hi-fi-dac",
+      "name": "Allo Piano Hi-Fi DAC",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "allo-piano-dac-pcm512x-audio",
+      "overlay_params": ""
+    },
+    {
+      "id": "audiophonics-es9018-dac",
+      "name": "Audiophonics ES9018 DAC",
+      "dacchip": "ESS Sabre ES9018 K2M",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "audiophonics-es9023-dac",
+      "name": "Audiophonics ES9023 DAC",
+      "dacchip": "ESS Sabre ES9023",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "audiophonics-es9028-9038-dac",
+      "name": "Audiophonics ES9028/9038 DAC",
+      "dacchip": "ESS Sabre ES9028/9038 Q2M",
+      "iface": "I2S",
+      "overlay": "i-sabre-q2m",
+      "overlay_params": ""
+    },
+    {
+      "id": "audiophonics-pcm5102-dac",
+      "name": "Audiophonics PCM5102 DAC",
+      "dacchip": "Burr Brown PCM5102A",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "audiophonics-pcm5122-dac",
+      "name": "Audiophonics PCM5122 DAC",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "audiophonics-tda1387-dac",
+      "name": "Audiophonics TDA1387 DAC",
+      "dacchip": "Philips TDA1387",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "dddac1794-nos",
+      "name": "DDDAC1794 NOS",
+      "dacchip": "Burr Brown PCM1794",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "generic-i2s-hifiberry-dac",
+      "name": "Generic-I2S (hifiberry-dac)",
+      "dacchip": "Passive mode I2S device",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "generic-i2s-i2s-dac",
+      "name": "Generic-I2S (i2s-dac)",
+      "dacchip": "Passive mode I2S device",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifi-dac",
+      "name": "HIFI DAC",
+      "dacchip": "Burr Brown PCM5102A",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifi-dac-2",
+      "name": "HIFI DAC+",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifi-digi",
+      "name": "HIFI Digi",
+      "dacchip": "Wolfson WM8804G",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifi-digi-2",
+      "name": "HIFI Digi+",
+      "dacchip": "Wolfson WM8804G",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-amp-amp",
+      "name": "HiFiBerry Amp(Amp+)",
+      "dacchip": "Burr Brown TAS5713",
+      "iface": "I2S",
+      "overlay": "hifiberry-amp",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-amp2-4",
+      "name": "HiFiBerry Amp2/4",
+      "dacchip": "Burr Brown TAS5756M",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus-std",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-beocreate",
+      "name": "HiFiBerry Beocreate",
+      "dacchip": "Burr Brown PCM4104 DAC, TPA3128 Amp, Analog Devices ADAU1451 DSP",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac",
+      "name": "HiFiBerry DAC",
+      "dacchip": "Burr Brown PCM5102A",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac-2",
+      "name": "HiFiBerry DAC+",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus-std",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac-adc",
+      "name": "HiFiBerry DAC+ ADC",
+      "dacchip": "Burr Brown PCM5122, PCM1861 ADC",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplusadc",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac-dsp",
+      "name": "HiFiBerry DAC+ DSP",
+      "dacchip": "Burr Brown PCM5102A, Analog Devices ADAU1451 DSP",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac-light",
+      "name": "HiFiBerry DAC+ Light",
+      "dacchip": "ESS Sabre ES9023",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac-pro",
+      "name": "HiFiBerry DAC+ Pro",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus-pro",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac-zero",
+      "name": "HiFiBerry DAC+ Zero",
+      "dacchip": "Burr Brown PCM5101A",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac2-hd",
+      "name": "HiFiBerry DAC2 HD",
+      "dacchip": "Burr Brown PCM1796",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplushd",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-dac8x",
+      "name": "HiFiBerry DAC8x",
+      "dacchip": "Burr Brown PCM5101A x 8",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac8x",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-digi-digi",
+      "name": "HiFiBerry Digi(Digi+)",
+      "dacchip": "Cirrus Logic WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-digi-pro",
+      "name": "HiFiBerry Digi+ Pro",
+      "dacchip": "Cirrus Logic WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi-pro",
+      "overlay_params": ""
+    },
+    {
+      "id": "hifiberry-miniamp",
+      "name": "HiFiBerry MiniAmp",
+      "dacchip": "Burr Brown PCM5101A, Diodes PAM8403",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "iancanada-ess-controller",
+      "name": "IanCanada (ESS Controller)",
+      "dacchip": "ESS Sabre ES9028/9038 Q2M",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "iancanada-i2s-dac",
+      "name": "IanCanada (i2s-dac)",
+      "dacchip": "Passive mode I2S device",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "iancanada-monitorpi-pro-w-o-ess-dac",
+      "name": "IanCanada (MonitorPi Pro w/o ESS DAC)",
+      "dacchip": "MonitorPi Pro",
+      "iface": "I2S",
+      "overlay": "i-sabre-q2m",
+      "overlay_params": ""
+    },
+    {
+      "id": "iancanada-monitorpi-pro-with-ess-dac",
+      "name": "IanCanada (MonitorPi Pro with ESS DAC)",
+      "dacchip": "ESS Sabre ES9028/9038 Q2M",
+      "iface": "I2S",
+      "overlay": "i-sabre-q2m",
+      "overlay_params": ""
+    },
+    {
+      "id": "iancanada-transportpi-digi",
+      "name": "IanCanada (TransportPi Digi)",
+      "dacchip": "Cirrus Logic WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi-pro",
+      "overlay_params": ""
+    },
+    {
+      "id": "iqaudio-pi-amp",
+      "name": "IQaudIO Pi-AMP+",
+      "dacchip": "Burr Brown TPA3118",
+      "iface": "I2S",
+      "overlay": "iqaudio-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "iqaudio-pi-dac",
+      "name": "IQaudIO Pi-DAC",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "iqaudio-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "iqaudio-pi-dac-pro",
+      "name": "IQaudIO Pi-DAC PRO",
+      "dacchip": "Burr Brown PCM5242",
+      "iface": "I2S",
+      "overlay": "iqaudio-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "iqaudio-pi-dac-2",
+      "name": "IQaudIO Pi-DAC+",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "iqaudio-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "iqaudio-pi-daczero",
+      "name": "IQaudIO Pi-DACZero",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "iqaudio-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "iqaudio-pi-digi",
+      "name": "IQaudIO Pi-Digi+",
+      "dacchip": "Wolfson WM8804",
+      "iface": "I2S",
+      "overlay": "iqaudio-digi-wm8804-audio",
+      "overlay_params": ""
+    },
+    {
+      "id": "iqaudio-pi-digiamp",
+      "name": "IQaudIO Pi-DigiAMP+",
+      "dacchip": "Burr Brown TAS5756",
+      "iface": "I2S",
+      "overlay": "iqaudio-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "justboom-amp-hat-zero",
+      "name": "JustBoom AMP HAT(Zero)",
+      "dacchip": "Burr Brown TAS5756",
+      "iface": "I2S",
+      "overlay": "justboom-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "justboom-dac-hat-zero",
+      "name": "JustBoom DAC HAT(Zero)",
+      "dacchip": "Burr Brown PCM5122 (PCM5121)",
+      "iface": "I2S",
+      "overlay": "justboom-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "justboom-digi-hat-zero",
+      "name": "JustBoom Digi HAT(Zero)",
+      "dacchip": "Wolfson WM8804G",
+      "iface": "I2S",
+      "overlay": "justboom-digi",
+      "overlay_params": ""
+    },
+    {
+      "id": "mamboberry-hifi-dac",
+      "name": "Mamboberry HiFi DAC+",
+      "dacchip": "ESS Sabre ES9032",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "mamboberry-ls-dac",
+      "name": "Mamboberry LS DAC+",
+      "dacchip": "ESS Sabre ES9023p",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "merus-tm-amp-pihat-zw",
+      "name": "MERUS(tm) Amp piHAT ZW",
+      "dacchip": "Infineon MA12070P",
+      "iface": "I2S",
+      "overlay": "merus-amp",
+      "overlay_params": ""
+    },
+    {
+      "id": "pi2design-502dac",
+      "name": "Pi2Design 502DAC",
+      "dacchip": "Burr Brown PCM5122, Wolfson WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "pi2design-502dac-pro",
+      "name": "Pi2Design 502DAC PRO",
+      "dacchip": "Burr Brown PCM1792, Wolfson WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi-pro",
+      "overlay_params": ""
+    },
+    {
+      "id": "pi2design-503hta-hybrid-tube-amp",
+      "name": "Pi2Design 503HTA Hybrid Tube Amp",
+      "dacchip": "Burr Brown PCM5102A",
+      "iface": "I2S",
+      "overlay": "hifiberry-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "pi2design-aes",
+      "name": "Pi2Design AES",
+      "dacchip": "Wolfson WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi-pro",
+      "overlay_params": ""
+    },
+    {
+      "id": "pi2design-aes-lite",
+      "name": "Pi2Design AES-Lite",
+      "dacchip": "Wolfson WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi-pro",
+      "overlay_params": ""
+    },
+    {
+      "id": "pi2design-mercury",
+      "name": "Pi2Design Mercury",
+      "dacchip": "Wolfson WM8804",
+      "iface": "I2S",
+      "overlay": "hifiberry-digi-pro",
+      "overlay_params": ""
+    },
+    {
+      "id": "protodac-tda1387-x8",
+      "name": "ProtoDAC TDA1387 X8",
+      "dacchip": "Philips TDA1387 (8 chip module)",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "protodac-tda1387-x8-fifopima",
+      "name": "ProtoDAC TDA1387 X8 (FifoPiMa)",
+      "dacchip": "Philips TDA1387 (8 chip module)",
+      "iface": "I2S",
+      "overlay": "hifiberry-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "raspberry-pi-codec-zero",
+      "name": "Raspberry Pi Codec Zero",
+      "dacchip": "Dialog Semiconductor DA7212",
+      "iface": "I2S",
+      "overlay": "rpi-codeczero",
+      "overlay_params": ""
+    },
+    {
+      "id": "raspberry-pi-dac-pro",
+      "name": "Raspberry Pi DAC Pro",
+      "dacchip": "Burr Brown PCM5242",
+      "iface": "I2S",
+      "overlay": "rpi-dacpro",
+      "overlay_params": ""
+    },
+    {
+      "id": "raspberry-pi-dac",
+      "name": "Raspberry Pi DAC+",
+      "dacchip": "Burr Brown PCM5242",
+      "iface": "I2S",
+      "overlay": "rpi-dacplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "raspberry-pi-digiamp",
+      "name": "Raspberry Pi DigiAMP+",
+      "dacchip": "Burr Brown TAS5756",
+      "iface": "I2S",
+      "overlay": "rpi-digiampplus",
+      "overlay_params": ""
+    },
+    {
+      "id": "soekris-dam",
+      "name": "Soekris DAM",
+      "dacchip": "FPGA based",
+      "iface": "I2S",
+      "overlay": "i2s-dac",
+      "overlay_params": ""
+    },
+    {
+      "id": "suptronics-x400",
+      "name": "Suptronics x400",
+      "dacchip": "Burr Brown PCM5122",
+      "iface": "I2S",
+      "overlay": "iqaudio-dacplus",
+      "overlay_params": ""
+    }
+  ]
+}

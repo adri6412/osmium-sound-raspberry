@@ -16,7 +16,7 @@ STATE = {
     "np_animation": os.environ.get("MOCK_NP_ANIMATION", "none"), "autoexpand": 0, "ota": {"state": "idle"}, "lang": "it",
     "display_mode": "gui", "ui_resolution": "auto", "ui_screens": "mirror", "ui_rotation": 0, "ui_refresh": "native", "pointer": True, "ssh": False, "player_enabled": True,
     "lms_mode": "local", "lms_host": "", "tz": "Europe/Rome", "device_name": "Osmium", "ota_channel": "dev", "lyrion_channel": "release",
-    "audio": "hw:CARD=DAC,DEV=0", "shell_user": "", "pldir": "/srv/music/playlist", "skin": "osmium", "fmt": {"state": "idle"},
+    "audio": "hw:CARD=DAC,DEV=0", "dac_hat": "", "shell_user": "", "pldir": "/srv/music/playlist", "skin": "osmium", "fmt": {"state": "idle"},
     "install": {"state": "idle"}, "cd": {"no_disc": True}, "cdrip": {"state": "idle"},
     "bt_remotes": {"available": True, "supported": True, "adapter": True, "remotes": [], "found": []},
     # Settings → Audio (squeezelite model) and Audio zones; MOCK_ZONES=0 starts with none
@@ -678,6 +678,10 @@ class H(BaseHTTPRequestHandler):
                 "/lyrion_update/check": {"current": "9.0.2", "channels": {"release": {"version": "9.0.2"}, "nightly": {"version": "9.1.0~2026-08-25"}, "dev": {"version": "9.1.0"}}},
                 "/lyrion_update/status": {"message": "", "percent": 0, "running": False},
                 "/audio_devices": {"devices": [{"id": "default", "name": "System default"}, {"id": "hw:CARD=DAC,DEV=0", "name": "USB DAC"}, {"id": "hw:CARD=HDMI,DEV=0", "name": "HDMI"}], "current": STATE["audio"]},
+                "/dac_hats": {"supported": True, "current": STATE["dac_hat"], "cards": [
+                    {"id": "hifiberry-dacplus", "name": "HiFiBerry DAC+", "dacchip": "Burr Brown PCM5122", "overlay": "hifiberry-dacplus", "overlay_params": ""},
+                    {"id": "allo-boss-dac", "name": "Allo Boss DAC", "dacchip": "Burr Brown PCM5122", "overlay": "allo-boss-dac-pcm512x-audio", "overlay_params": "slave"},
+                    {"id": "iqaudio-dacplus", "name": "IQaudio DAC+", "dacchip": "Burr Brown PCM5122", "overlay": "iqaudio-dacplus", "overlay_params": ""}]},
                 "/shell_account": {"username": STATE["shell_user"]}, "/wired_dhcp": {"dhcp": True},
                 "/app_update/check": {"current": "2.5.24-dev.2", "latest": "2.5.24-dev.3", "update_available": True, "notes": "## 2.5.24-dev.3\n- UI nativa in Qt\n- correzioni varie\n" * 6},
                 "/system_update/check": {"current": "2.5.24-dev.2", "latest": "2.5.24-dev.2", "update_available": False},
@@ -896,6 +900,9 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/ota_channel": STATE["ota_channel"] = data.get("channel", "prod")
             if u.path == "/lyrion_channel": STATE["lyrion_channel"] = data.get("channel", "release")
             if u.path == "/set_audio_device": STATE["audio"] = data.get("device", "default")
+            if u.path == "/set_dac_hat":
+                STATE["dac_hat"] = data.get("id", "") or ""
+                return self._json({"success": True, "reboot_required": True, "current": STATE["dac_hat"]})
             if u.path == "/shell_account": STATE["shell_user"] = data.get("username", "")
             if u.path == "/install/start":
                 STATE["install"] = {"state": "running", "message": "Copying system…", "progress": 20}

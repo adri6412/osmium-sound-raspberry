@@ -392,6 +392,13 @@
     "audio": {
       "hint": "DAC / Wiedergabegerät, das squeezelite verwendet. DSD-Dateien erreichen den DAC nativ, wenn er sie so akzeptiert, sonst als DoP; die Wahl und die anderen Player-Optionen findest du unter Erweitert, weiter unten.",
       "dsdNative": "DSD nativ",
+      "hat": {
+        "title": "I2S-DAC-/HAT-Platine",
+        "help": "Wähle die auf den GPIO-Header gesteckte HAT-Platine. Das Device-Tree-Overlay wird beim Start geladen, daher startet der Player beim Übernehmen neu. Wähle \"Kein HAT\" für USB- oder HDMI-Audio.",
+        "none": "Kein HAT (USB / HDMI)",
+        "rebootPrompt": "Der Player muss neu starten, um die gewählte Platine zu laden. Fortfahren?",
+        "saved": "HAT-Platine gespeichert, Neustart…"
+      },
       "advancedTitle": "Erweitert",
       "advancedHint": "Alles Folgende wird sofort angewendet und startet den Player kurz neu. Automatisch passt für fast alle DACs.",
       "advancedLink": "DSD, Konvertierung von PCM zu DSD, Frequenzgrenze, Buffer und der Rest des Players sind unter Erweiterte Audio-Einstellungen.",

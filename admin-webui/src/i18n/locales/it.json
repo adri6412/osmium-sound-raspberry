@@ -392,6 +392,13 @@
     "audio": {
       "hint": "DAC / dispositivo di riproduzione usato da squeezelite. I file DSD arrivano al DAC in modo nativo se lo accetta così, altrimenti come DoP; la scelta e le altre opzioni del player sono sotto Avanzate, qui in basso.",
       "dsdNative": "DSD nativo",
+      "hat": {
+        "title": "Scheda DAC / HAT I2S",
+        "help": "Seleziona la scheda HAT collegata al connettore GPIO. L'overlay device-tree viene caricato al boot, quindi applicandolo il player si riavvia. Scegli \"Nessun HAT\" per l'audio USB o HDMI.",
+        "none": "Nessun HAT (USB / HDMI)",
+        "rebootPrompt": "Il player deve riavviarsi per caricare la scheda selezionata. Continuare?",
+        "saved": "Scheda HAT salvata, riavvio in corso…"
+      },
       "advancedTitle": "Avanzate",
       "advancedHint": "Tutto quello che segue si applica subito e riavvia il player per un attimo. Automatico va bene per quasi tutti i DAC.",
       "advancedLink": "DSD, conversione da PCM a DSD, limite di frequenza, buffer e il resto del lettore sono in Impostazioni Audio Avanzate.",

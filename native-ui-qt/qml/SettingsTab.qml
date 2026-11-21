@@ -17,6 +17,10 @@ Item {
 
     // ─── stato locale della sezione aperta (S.*) ───────────────────────────
     property string audioSel: ""
+    // Audio → I2S HAT: the card the user highlighted but has not applied. The
+    // sentinel "@cur" means "untouched" (show cfg.dacHatCur); "" is a real choice
+    // (No HAT), so it must be distinct from the untouched state.
+    property string hatSel: "@cur"
     // Audio → Advanced: the extra-arguments field, as typed; `dirty` tells a
     // cleared field from one not touched yet (which shows the saved value)
     property string sqExtraEdit: ""; property bool sqExtraDirty: false
@@ -273,6 +277,10 @@ Item {
         property var storeAnims: []                                 // [{id, name:{en,it}, scene}]
         property string otaChannel: "prod"; property var otaChannels: ["prod", "dev"]
         property string audioCur: ""; property var audio: []          // [{id,name,dsd}]
+        // Audio → I2S HAT board (Raspberry Pi only). dacSupported gates the whole
+        // sub-section; dacHats is the shipped card catalogue, dacHatCur the id in
+        // effect. Boot-time overlay — distinct from the runtime output above.
+        property bool dacSupported: false; property var dacHats: []; property string dacHatCur: ""
         // the rest of squeezelite's command line (api /squeezelite_conf)
         property var sq: ({ loaded: false, conf: {}, args: "", dsd_detected: "dop", mixers: [], choices: {}, pcm2dsd: {} })
         // System tweaks (api /system_tweaks): OS-level CPU knobs, off by default.
@@ -524,6 +532,11 @@ Item {
             get(api("/audio_devices"), function(d) {
                 audioCur = str(d, "current")
                 audio = (d.devices || []).map(function(x) { return { id: String(x.id || ""), name: String(x.name || ""), dsd: String(x.dsd || "") } })
+            })
+            get(api("/dac_hats"), function(d) {
+                dacSupported = d.supported === true
+                dacHatCur = str(d, "current")
+                dacHats = (d.cards || []).map(function(x) { return { id: String(x.id || ""), name: String(x.name || ""), dacchip: String(x.dacchip || "") } })
             })
             get(api("/squeezelite_conf"), function(d) {
                 sq = { loaded: !!d.conf, conf: d.conf || {}, args: String(d.args || ""), dsd_detected: String(d.dsd_detected || "dop"),
@@ -890,7 +903,7 @@ Item {
         if (active < 0) gridY = page.contentY        // leaving the tile grid: remember its scroll
         active = i; msg = ""; pendAct = ""; countdown = 0; backTo = ""
         if (groupOf(id) !== "") grp = groupOf(id)
-        audioSel = ""; sshUser = ""; sshPass = ""; nameEdit = ""; hostEdit = ""
+        audioSel = ""; hatSel = "@cur"; sshUser = ""; sshPass = ""; nameEdit = ""; hostEdit = ""
         band = -1; bandAdd = -1; bandShare = -1; brId = ""; pickOwner = 0; pickNew = ""
         btBand = -1; btNameEdit = ""; btBusy = false; btScanning = false
         zoneBand = -1; zoneNameEdit = ""; zoneNewOut = ""; zoneNewName = ""; zoneBusy = false
@@ -1465,10 +1478,30 @@ Item {
         }
         grid([acell(Tr.t("settings.audio.refreshList"), "audio_refresh", "accent", { icon: "rotate-cw", hh: 48 }),
               acell(Tr.t("settings.audio.setOutput"), "audio_apply", "gold", { icon: "volume-2", bold: true, hh: 48 })])
+        // I2S DAC / HAT board (Raspberry Pi only): picks the GPIO board whose
+        // device-tree overlay is loaded at boot, so it then appears as an output
+        // above. Hidden on hardware without I2S HATs (x86), where dacSupported is
+        // false. A reboot applies the change, so the apply confirms a reboot.
+        if (cfg.dacSupported) secHat()
         // DSD, PCM to DSD and the rest of squeezelite: a section of their own
         sep()
         help("settings.audio.advancedLink", 12)
         var adv = action(Tr.t("settings.sections.audioAdvanced"), "open_audio_advanced", "dark"); adv.icon = "option"; adv.hh = 48
+    }
+    // Audio → I2S DAC / HAT board (Raspberry Pi only). The overlay is loaded at
+    // boot, so this is a hardware choice distinct from the runtime output picker;
+    // applying it reboots. "None" (empty id) means USB/HDMI only, no HAT overlay.
+    function secHat() {
+        sep()
+        label("settings.audio.hat.title")
+        help("settings.audio.hat.help", 12)
+        var hsel = hatSel === "@cur" ? cfg.dacHatCur : hatSel
+        option(Tr.t("settings.audio.hat.none"), "", "", hsel === "", "hat_pick").hh = 56
+        for (var i = 0; i < cfg.dacHats.length; i++) {
+            var c = cfg.dacHats[i]
+            var r = option(c.name, c.dacchip, c.id, hsel === c.id, "hat_pick"); r.hh = 60
+        }
+        grid([acell(Tr.t("settings.audio.hat.apply"), "hat_apply", "gold", { icon: "rotate-cw", bold: true, hh: 48 })])
     }
     // Settings → Advanced audio tweaks: everything about how the built-in
     // player feeds the DAC (squeezelite's model, PCM to DSD). Zones keep
@@ -2974,6 +3007,20 @@ Item {
             if (!audioSel) return
             post(A("/set_audio_device"), { device: audioSel }); cfg.audioCur = audioSel; say(Tr.t("settings.audio.updated")); break
         case "audio_refresh": cfg.load(); break
+        // I2S HAT board: pick stages the id (arg "" = No HAT). Apply confirms a
+        // reboot — the overlay only loads at boot — then posts and reboots.
+        case "hat_pick": hatSel = arg; break
+        case "hat_apply": {
+            var hv = hatSel === "@cur" ? cfg.dacHatCur : hatSel
+            Ui.dialogs.confirm(Tr.t("settings.audio.hat.rebootPrompt"), Tr.t("settings.controls.reboot"), false, function(ok) {
+                if (!ok) return
+                post(A("/set_dac_hat"), { id: hv }, function(d) {
+                    if (d && d.success) { cfg.dacHatCur = hv; post(A("/reboot"), {}); say(Tr.t("settings.msg.rebooting")) }
+                    else say(Tr.t("settings.audio.hat.setFailed"))
+                })
+            })
+            break
+        }
         // Audio → Advanced (see secSqueezelite); toggles send the opposite of
         // what the row shows, like the SSH and pointer switches
         case "sq_dsd": sqSet({ dsd: arg }); break

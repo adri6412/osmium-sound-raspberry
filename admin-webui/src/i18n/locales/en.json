@@ -392,6 +392,13 @@
     "audio": {
       "hint": "DAC / output device used by squeezelite. DSD files reach the DAC natively when it accepts them that way, otherwise as DoP; the choice and the other player options are under Advanced below.",
       "dsdNative": "native DSD",
+      "hat": {
+        "title": "I2S DAC / HAT board",
+        "help": "Select the HAT board plugged onto the GPIO header. The device-tree overlay is loaded at boot, so applying it reboots the player. Pick \"No HAT\" for USB or HDMI audio.",
+        "none": "No HAT (USB / HDMI)",
+        "rebootPrompt": "The player must reboot to load the selected board. Continue?",
+        "saved": "HAT board saved, rebooting…"
+      },
       "advancedTitle": "Advanced",
       "advancedHint": "Everything below applies right away and restarts the player for a moment. Automatic is right for nearly every DAC.",
       "advancedLink": "DSD, PCM to DSD conversion, sample rate limit, buffers and the rest of the player are in Advanced Audio Tweaks.",

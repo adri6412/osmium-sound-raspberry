@@ -270,6 +270,7 @@ const devices = ref([]); const currentDevice = ref('default'); const playerName 
 async function loadAudio() {
   const r = await api.sys('audio_devices');
   if (r.ok) { devices.value = r.data.devices || []; currentDevice.value = r.data.current || 'default'; }
+  loadDacHats();
   const p = await api.sys('device_name'); if (p.ok) playerName.value = p.data.name || '';
   loadSq();
 }
@@ -278,6 +279,27 @@ async function pickDevice(id) {
   const r = await api.sysPost('audio_device', { device: id });
   say(r.ok && r.data.success !== false ? t('settings.audio.changed') : bodyMsg(r, t('settings.audio.changeFailed')), !(r.ok && r.data.success !== false));
   loadSq();   // what the new DAC declares for DSD, and its mixer controls
+}
+
+// I2S DAC / HAT board (Raspberry Pi only). The overlay loads at boot, so this is
+// a hardware choice separate from the runtime output picker above; applying it
+// writes the boot config.txt and reboots. dacSupported hides the whole block on
+// x86. id '' = No HAT (USB/HDMI only).
+const dacSupported = ref(false); const dacHats = ref([]); const currentHat = ref('');
+async function loadDacHats() {
+  const r = await api.sys('dac_hats');
+  if (r.ok) { dacSupported.value = r.data.supported === true; dacHats.value = r.data.cards || []; currentHat.value = r.data.current || ''; }
+}
+async function applyHat(id) {
+  if (id === currentHat.value) return;
+  if (!confirm(t('settings.audio.hat.rebootPrompt'))) return;
+  const r = await api.sysPost('dac_hat', { id });
+  const ok = r.ok && r.data.success !== false;
+  say(bodyMsg(r, t('settings.audio.hat.saved')), !ok);
+  if (!ok) { loadDacHats(); return; }
+  currentHat.value = id;
+  await api.sysPost('reboot', {});
+  waitForReboot();
 }
 
 // ── Audio → Advanced: the rest of squeezelite's command line ──────
@@ -2177,6 +2199,20 @@ function drvStartPoll() {
       <div v-for="d in devices" :key="d.id" class="net between" @click="pickDevice(d.id)">
         <span>{{ d.name || d.id }}<span class="muted" v-if="d.dsd === 'native'" style="margin-left: 8px; font-size: 0.85em;">{{ t('settings.audio.dsdNative') }}</span></span><span class="check" v-if="d.id === currentDevice">✓</span>
       </div>
+
+      <!-- I2S DAC / HAT board (Raspberry Pi only). Loads a device-tree overlay
+           at boot, so applying it reboots. Hidden on x86 (dacSupported=false). -->
+      <div v-if="dacSupported" style="margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.1);">
+        <label>{{ t('settings.audio.hat.title') }}</label>
+        <p class="sub" style="margin-top: 4px;">{{ t('settings.audio.hat.help') }}</p>
+        <div class="net between" @click="applyHat('')">
+          <span>{{ t('settings.audio.hat.none') }}</span><span class="check" v-if="currentHat === ''">✓</span>
+        </div>
+        <div v-for="c in dacHats" :key="c.id" class="net between" @click="applyHat(c.id)">
+          <span>{{ c.name }}<span class="muted" v-if="c.dacchip" style="margin-left: 8px; font-size: 0.85em;">{{ c.dacchip }}</span></span><span class="check" v-if="c.id === currentHat">✓</span>
+        </div>
+      </div>
+
       <label>{{ t('settings.audio.playerName') }}</label>
       <div class="row"><input v-model="playerName" /><button class="secondary fit" @click="saveName">{{ t('common.save') }}</button></div>
       <p class="sub" style="margin-top: 4px;">{{ t('settings.audio.playerNameHint') }}</p>
