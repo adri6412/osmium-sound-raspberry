@@ -116,6 +116,13 @@ systemctl disable bluealsa.service bluealsa-aplay.service || true
 echo "I: [hifi] disabling getty on tty1 (no text console flashes)"
 systemctl mask getty@tty1.service || true
 
+# Kiosk appliance: no login shell on the other VTs. tty1 is the Qt kiosk; the
+# rest are reached with Ctrl+Alt+F2..F6 and would spawn an autovt getty. Mask
+# the on-demand template so switching VT opens a blank screen, never a shell.
+# (logind.conf.d/10-kiosk-no-vts.conf also sets NAutoVTs=0 / ReserveVT=0.)
+echo "I: [hifi] disabling getty on the other VTs (Ctrl+Alt+Fn opens no shell)"
+systemctl mask autovt@.service || true
+
 echo "I: [hifi] creating /var/log/hifi (persistent, rotated logs for support bundle)"
 mkdir -p /var/log/hifi
 chmod 0750 /var/log/hifi
