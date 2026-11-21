@@ -17,10 +17,6 @@ Item {
 
     // ─── stato locale della sezione aperta (S.*) ───────────────────────────
     property string audioSel: ""
-    // Audio → I2S HAT: the card the user highlighted but has not applied. The
-    // sentinel "@cur" means "untouched" (show cfg.dacHatCur); "" is a real choice
-    // (No HAT), so it must be distinct from the untouched state.
-    property string hatSel: "@cur"
     // Audio → Advanced: the extra-arguments field, as typed; `dirty` tells a
     // cleared field from one not touched yet (which shows the saved value)
     property string sqExtraEdit: ""; property bool sqExtraDirty: false
@@ -903,7 +899,7 @@ Item {
         if (active < 0) gridY = page.contentY        // leaving the tile grid: remember its scroll
         active = i; msg = ""; pendAct = ""; countdown = 0; backTo = ""
         if (groupOf(id) !== "") grp = groupOf(id)
-        audioSel = ""; hatSel = "@cur"; sshUser = ""; sshPass = ""; nameEdit = ""; hostEdit = ""
+        audioSel = ""; sshUser = ""; sshPass = ""; nameEdit = ""; hostEdit = ""
         band = -1; bandAdd = -1; bandShare = -1; brId = ""; pickOwner = 0; pickNew = ""
         btBand = -1; btNameEdit = ""; btBusy = false; btScanning = false
         zoneBand = -1; zoneNameEdit = ""; zoneNewOut = ""; zoneNewName = ""; zoneBusy = false
@@ -1495,13 +1491,15 @@ Item {
         sep()
         label("settings.audio.hat.title")
         help("settings.audio.hat.help", 12)
-        var hsel = hatSel === "@cur" ? cfg.dacHatCur : hatSel
-        option(Tr.t("settings.audio.hat.none"), "", "", hsel === "", "hat_pick").hh = 56
+        // Picking a board applies it straight away (hat_pick confirms the reboot),
+        // so there is no separate Apply step and the highlight follows the saved
+        // choice (dacHatCur). A long 68-row list buried an Apply cell at the
+        // bottom the remote rarely reached; now the choice IS the apply.
+        option(Tr.t("settings.audio.hat.none"), "", "", cfg.dacHatCur === "", "hat_pick").hh = 56
         for (var i = 0; i < cfg.dacHats.length; i++) {
             var c = cfg.dacHats[i]
-            var r = option(c.name, c.dacchip, c.id, hsel === c.id, "hat_pick"); r.hh = 60
+            var r = option(c.name, c.dacchip, c.id, cfg.dacHatCur === c.id, "hat_pick"); r.hh = 60
         }
-        grid([acell(Tr.t("settings.audio.hat.apply"), "hat_apply", "gold", { icon: "rotate-cw", bold: true, hh: 48 })])
     }
     // Settings → Advanced audio tweaks: everything about how the built-in
     // player feeds the DAC (squeezelite's model, PCM to DSD). Zones keep
@@ -3007,15 +3005,15 @@ Item {
             if (!audioSel) return
             post(A("/set_audio_device"), { device: audioSel }); cfg.audioCur = audioSel; say(Tr.t("settings.audio.updated")); break
         case "audio_refresh": cfg.load(); break
-        // I2S HAT board: pick stages the id (arg "" = No HAT). Apply confirms a
-        // reboot — the overlay only loads at boot — then posts and reboots.
-        case "hat_pick": hatSel = arg; break
-        case "hat_apply": {
-            var hv = hatSel === "@cur" ? cfg.dacHatCur : hatSel
+        // I2S HAT board: picking a board applies it straight away (arg "" = No
+        // HAT). Confirm the reboot — the overlay only loads at boot — then post
+        // and reboot. Choosing the board already in use does nothing.
+        case "hat_pick": {
+            if (arg === cfg.dacHatCur) break
             Ui.dialogs.confirm(Tr.t("settings.audio.hat.rebootPrompt"), Tr.t("settings.controls.reboot"), false, function(ok) {
                 if (!ok) return
-                post(A("/set_dac_hat"), { id: hv }, function(d) {
-                    if (d && d.success) { cfg.dacHatCur = hv; post(A("/reboot"), {}); say(Tr.t("settings.msg.rebooting")) }
+                post(A("/set_dac_hat"), { id: arg }, function(d) {
+                    if (d && d.success) { cfg.dacHatCur = arg; post(A("/reboot"), {}); say(Tr.t("settings.msg.rebooting")) }
                     else say(Tr.t("settings.audio.hat.setFailed"))
                 })
             })

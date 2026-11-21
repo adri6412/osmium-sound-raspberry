@@ -1449,7 +1449,6 @@
         "title": "Scheda DAC / HAT I2S",
         "help": "Seleziona la scheda DAC HiFi (HAT) innestata sul connettore GPIO del Pi. Carica il driver della scheda al boot; dopo il riavvio compare qui sopra come uscita di riproduzione. Un DAC USB o HDMI non richiede nulla qui.",
         "none": "Nessun HAT (solo USB / HDMI)",
-        "apply": "Applica (riavvio)",
         "rebootPrompt": "La scheda DAC si applica al riavvio. Riavviare ora?",
         "saved": "Salvato — riavvia per applicare.",
         "setFailed": "Impossibile applicare la scheda DAC."
