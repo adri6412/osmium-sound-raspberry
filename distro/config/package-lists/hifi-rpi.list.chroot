@@ -145,6 +145,7 @@ ca-certificates
 openssl
 isc-dhcp-client
 iproute2
+iputils-ping
 network-manager
 dnsmasq-base
 locales
