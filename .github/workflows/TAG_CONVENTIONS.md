@@ -44,8 +44,8 @@ with its own `companion-v*` tags, APK Release and F-Droid repo.
   as root — deliberately not reachable via the network API). Once a fix is
   validated on `alpha`, merge/cherry-pick it into `svil` and cut the next real
   `v2.5.21-dev.119` there for the shared dev channel.
-- **`gh-pages`** is generated (`ota/` manifests; the website is deployed from
-  `main` by `deploy-pages.yml`) — never edit it by hand.
+- **`gh-pages`** is generated (`ota/` manifests) — never edit it by hand. The
+  public site lives in the separate `osmium-sound-site` repo.
 
 Promotion: PR `svil` → `main`, then tag a stable `vX.Y.Z` on `main`.
 

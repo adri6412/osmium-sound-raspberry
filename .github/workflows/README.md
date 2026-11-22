@@ -1,22 +1,25 @@
 # GitHub Actions Workflows
 
 CI for the whole Osmium Sound repository: appliance releases (OTA bundles),
-the install ISO, Osmium Flasher, the website and storage housekeeping.
+the install ISO, Osmium Flasher and storage housekeeping.
 Tag/branch conventions and the release channels are in
 [TAG_CONVENTIONS.md](TAG_CONVENTIONS.md). The Android companion app has moved to
-its own repo, [`adri6412/osmium-companion-android`](https://github.com/adri6412/osmium-companion-android).
+its own repo, [`adri6412/osmium-companion-android`](https://github.com/adri6412/osmium-companion-android);
+the public site **osmiumsound.it** has likewise moved to
+[`adri6412/osmium-sound-site`](https://github.com/adri6412/osmium-sound-site).
+This Raspberry repo does **not** deploy the site: its OTA is served from Oracle
+Object Storage (`platform.conf`, `HIFI_OTA_MANIFEST_BASE`), not Cloudflare Pages.
 
 | Workflow | Trigger | Produces |
 |---|---|---|
 | [`build-ui-ota.yml`](build-ui-ota.yml) | push of a `v*` tag; manual | OTA bundles `hifi-qtui-`, `hifi-system-`, `hifi-os-` (+ sha256, OS signature), offline dev installer, GitHub Release, payloads of every channel also on `file.osmiumsound.it/ota/<tag>/`, OTA manifest on `gh-pages` (+ a copy per channel on file.osmiumsound.it), then `prune-ota-r2.yml` |
 | [`build-iso.yml`](build-iso.yml) | manual (`workflow_dispatch`, tag as input) | `hifi-player-<tag>.iso` + `.sha256` + `.sha256.sig` + `latest.json`, and the USB/disk image `hifi-player-<tag>.img.xz` + sidecars (artifacts; optionally attached to the Release) |
 | [`build-flasher.yml`](build-flasher.yml) | manual | Osmium Flasher binaries (Windows `.exe`, Linux `.run`) as artifacts |
-| [`deploy-pages.yml`](deploy-pages.yml) | push to `main` touching `website/**`; end of every `build-ui-ota.yml` run; manual | deploys `website/` + `ota/` from `gh-pages` to Cloudflare Pages (osmiumsound.it) with wrangler |
 | [`prune-ota-r2.yml`](prune-ota-r2.yml) | called by `build-ui-ota.yml` after `verify-release`; nightly; manual (dry run by default) | deletes from `file.osmiumsound.it/ota/` every release no channel's manifest names (`prune-ota-r2.py`) |
 | [`cleanup-actions-storage.yml`](cleanup-actions-storage.yml), [`Clean.yml`](Clean.yml) | manual | delete Actions caches / artifacts to free storage |
 
 Helper scripts live in [`../scripts/`](../scripts/): `make-ota-manifest.py`
-(OTA manifest for `gh-pages`, deployed to Pages by `deploy-pages.yml`), `make-iso-manifest.py` (`latest.json` for
+(OTA manifest for `gh-pages`), `make-iso-manifest.py` (`latest.json` for
 the flasher) and `prune-ota-r2.py` (what stays on file.osmiumsound.it/ota/). The repo-root [`tools/publish-iso.sh`](../../tools/publish-iso.sh)
 reproduces the ISO signing + manifest step by hand for an ISO already on disk.
 
@@ -83,9 +86,9 @@ no Release).
 11. Builds the OTA manifest (`ota/latest-prod.json` for a stable tag,
     `ota/latest-dev.json` / `latest-alpha.json` for prereleases — see
     `make-ota-manifest.py`) and pushes it to the `gh-pages` branch under
-    `ota/` with `keep_files: true` (so the website and the other channels'
-    manifests on the same branch are untouched). Devices read it from the
-    Cloudflare Pages origin first and fall back to the GitHub REST API.
+    `ota/` with `keep_files: true` (so the other channels' manifests on the same
+    branch are untouched). Devices read it from the OTA origin first and fall back
+    to the GitHub REST API.
 
 **Secrets:** `OTA_SIGNING_KEY` (Ed25519 private key PEM, see
 `distro/ota-keys/README.md`), `GITHUB_TOKEN` (automatic).
@@ -141,25 +144,13 @@ file.osmiumsound.it; the binaries are unsigned.
 
 ---
 
-## `deploy-pages.yml` — website
+## Website — now in `osmium-sound-site`
 
-Deploys the public site **osmiumsound.it** (Cloudflare Pages project
-`osmium-sound`) with `wrangler pages deploy`. Each deployment is assembled from
-scratch: `website/` from `main` (its `functions/` become the Pages Functions,
-not files) plus `ota/` from the `gh-pages` branch, so a file taken out of
-`website/` really disappears from the site. Runs on a push to
-`main` touching `website/**`, after every run of `build-ui-ota.yml`
-(`workflow_run`, which always uses `main`'s copy of this file, whatever branch
-the tag came from), and by hand. It ends by
-checking that `osmium-sound.pages.dev/ota/latest-*.json` — where devices look
-for updates — match `gh-pages` byte for byte. Changes on `svil`/`alpha` alone
-never deploy.
-
-`gh-pages` is now only the store of `ota/`: Cloudflare no longer
-builds from it (automatic Git deployments are off on the project). The D1
-binding, the secrets (`BETA_USER`, `BETA_PASSWORD`, `KOFI_VERIFICATION_TOKEN`)
-and the custom domains stay in the Cloudflare project. Needs the
-`CLOUDFLARE_API_TOKEN` secret (Account › Cloudflare Pages › Edit).
+The public site **osmiumsound.it** is no longer built from here; it moved to
+[`adri6412/osmium-sound-site`](https://github.com/adri6412/osmium-sound-site),
+which owns the Cloudflare Pages project. This Raspberry repo never touched the
+site in production anyway: Pi devices read their OTA manifest from Oracle Object
+Storage (`platform.conf`, `HIFI_OTA_MANIFEST_BASE`), not Cloudflare Pages.
 
 ---
 

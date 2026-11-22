@@ -796,25 +796,9 @@ jobs:
           enable_jekyll: false
           commit_message: "ota: manifest ${{ github.ref_name }} (+ immagine RAUC)"
 
-  # The manifest is on gh-pages now, but devices read it from Cloudflare Pages
-  # (OTA_MANIFEST_BASE), which only changes when deploy-pages.yml runs.
-  # 🚨 deploy-pages.yml also listens to workflow_run of this workflow, and that
-  # never fires here: GitHub emits no workflow_run for a run on a tag ref, and
-  # every release is one. v2.5.26-dev.1-alpha4 reached gh-pages and R2 and
-  # stayed invisible to the devices until a hand-run deploy. So this run asks
-  # for the deploy itself; GITHUB_TOKEN may start a workflow_dispatch.
-  deploy-site:
-    runs-on: ubuntu-latest
-    needs: publish-image
-    if: ${{ always() && needs.publish-image.result == 'success' }}
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - name: Put the new manifest on Cloudflare Pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run deploy-pages.yml --ref main -R "${{ github.repository }}"
+  # No site deploy from here: the Raspberry OTA is served from Oracle Object
+  # Storage (platform.conf, OTA_MANIFEST_BASE), not Cloudflare Pages, and the
+  # public site now lives in the adri6412/osmium-sound-site repo.
 
   # 🚨 A release has to serve BOTH worlds, always. We cannot know when a given
   # owner will update, or whether they will have migrated by then: a device
