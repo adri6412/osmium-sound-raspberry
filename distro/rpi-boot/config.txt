@@ -74,4 +74,12 @@ dtparam=audio=off
 # hifi-rpi-dacoverlay.sh is the single renderer for both paths; do NOT edit inside.
 # >>> osmium-dac
 # <<< osmium-dac
+# The chosen DSI panel overlay is injected BETWEEN the two markers below (same as
+# the DAC block above, but kept separate so the two never overwrite each other),
+# both when the boot FAT is (re)generated (hifi-rpi-bootfat.sh, on every OTA) and
+# when the user picks a panel at runtime (api_server /set_display_panel). Empty
+# block = no panel overlay (firmware auto-detects the official Raspberry Pi panel,
+# or HDMI-only). hifi-rpi-dsioverlay.sh is the single renderer; do NOT edit inside.
+# >>> osmium-dsi
+# <<< osmium-dsi
 # The Pi has no hardware RTC; NTP (systemd-timesyncd) sets the clock at boot.

@@ -1,0 +1,104 @@
+{
+  "_source": "raspberrypi/linux rpi-6.12.y arch/arm/boot/dts/overlays/README — DSI panel overlays (vc4-kms-dsi-*). Tokens taken from that README; confirm against the overlays/ actually shipped in the image (api_server filters the list to the .dtbo present on the device).",
+  "_note": "Each entry's dtoverlay payload is <overlay>[,<overlay_params>]. An empty overlay means the panel is auto-detected by the VideoCore firmware (the official Raspberry Pi 7-inch Touchscreen and Touch Display 2) and needs no overlay. DPI panels (e.g. Pimoroni HyperPixel) are intentionally excluded: they occupy the GPIO header and clash with an I2S DAC HAT.",
+  "panels": [
+    {
+      "id": "official-auto",
+      "name": "Raspberry Pi Official Display (7\" / Touch Display 2)",
+      "detail": "auto-detect, no overlay",
+      "overlay": "",
+      "overlay_params": ""
+    },
+    {
+      "id": "waveshare-4-0-c",
+      "name": "Waveshare 4.0\" DSI (C)",
+      "detail": "720×720",
+      "overlay": "vc4-kms-dsi-waveshare-panel",
+      "overlay_params": "4_0_inchC"
+    },
+    {
+      "id": "waveshare-5-0",
+      "name": "Waveshare 5.0\" DSI",
+      "detail": "720×1280",
+      "overlay": "vc4-kms-dsi-waveshare-panel",
+      "overlay_params": "5_0_inch"
+    },
+    {
+      "id": "waveshare-7-0-c",
+      "name": "Waveshare 7.0\" DSI (C)",
+      "detail": "1024×600",
+      "overlay": "vc4-kms-dsi-waveshare-panel",
+      "overlay_params": "7_0_inchC"
+    },
+    {
+      "id": "waveshare-8-0",
+      "name": "Waveshare 8.0\" DSI",
+      "detail": "1280×800",
+      "overlay": "vc4-kms-dsi-waveshare-panel",
+      "overlay_params": "8_0_inch"
+    },
+    {
+      "id": "waveshare-10-1",
+      "name": "Waveshare 10.1\" DSI",
+      "detail": "1280×800",
+      "overlay": "vc4-kms-dsi-waveshare-panel",
+      "overlay_params": "10_1_inch"
+    },
+    {
+      "id": "waveshare-v2-5-0-a",
+      "name": "Waveshare 5.0\" DSI (A, v2)",
+      "detail": "newer panel revision",
+      "overlay": "vc4-kms-dsi-waveshare-panel-v2",
+      "overlay_params": "5_0_inch_a"
+    },
+    {
+      "id": "waveshare-v2-7-0-c",
+      "name": "Waveshare 7.0\" DSI (C, v2)",
+      "detail": "newer panel revision",
+      "overlay": "vc4-kms-dsi-waveshare-panel-v2",
+      "overlay_params": "7_0_inch_c"
+    },
+    {
+      "id": "waveshare-v2-8-0-a",
+      "name": "Waveshare 8.0\" DSI (A, v2)",
+      "detail": "newer panel revision",
+      "overlay": "vc4-kms-dsi-waveshare-panel-v2",
+      "overlay_params": "8_0_inch_a"
+    },
+    {
+      "id": "waveshare-v2-10-1-b",
+      "name": "Waveshare 10.1\" DSI (B, v2)",
+      "detail": "newer panel revision",
+      "overlay": "vc4-kms-dsi-waveshare-panel-v2",
+      "overlay_params": "10_1_inch_b"
+    },
+    {
+      "id": "ili9881-5",
+      "name": "ILI9881-based 5\" DSI",
+      "detail": "720×1280",
+      "overlay": "vc4-kms-dsi-ili9881-5inch",
+      "overlay_params": ""
+    },
+    {
+      "id": "ili9881-7",
+      "name": "ILI9881-based 7\" DSI",
+      "detail": "720×1280",
+      "overlay": "vc4-kms-dsi-ili9881-7inch",
+      "overlay_params": ""
+    },
+    {
+      "id": "ili79600-10-1",
+      "name": "ILI79600-based 10.1\" DSI",
+      "detail": "1280×800",
+      "overlay": "vc4-kms-dsi-ili79600-10-1inch",
+      "overlay_params": ""
+    },
+    {
+      "id": "waveshare-800x480",
+      "name": "Waveshare 800×480 DSI (older)",
+      "detail": "legacy 5\"/7\" 800×480",
+      "overlay": "vc4-kms-dsi-waveshare-800x480",
+      "overlay_params": ""
+    }
+  ]
+}

@@ -105,6 +105,24 @@ else
     log "WARN: $DAC_RENDER missing; config.txt has no HAT overlay injected"
 fi
 
+# Same for the user-chosen DSI panel overlay (separate marker block, separate
+# renderer). The choice lives at /etc/hifi-player/display-panel.conf
+# (display=/touch= key=value lines). Absent (factory build) = no panel overlay.
+DSI_PANEL_CONF="${DSI_PANEL_CONF:-/etc/hifi-player/display-panel.conf}"
+DSI_RENDER="$SQ/usr/local/sbin/hifi-rpi-dsioverlay.sh"
+_dsi_overlay=""
+_dsi_touch=""
+if [ -f "$DSI_PANEL_CONF" ]; then
+    _dsi_overlay=$(sed -n 's/^display=//p' "$DSI_PANEL_CONF" | head -n 1)
+    _dsi_touch=$(sed -n 's/^touch=//p' "$DSI_PANEL_CONF" | head -n 1)
+fi
+if [ -x "$DSI_RENDER" ]; then
+    sh "$DSI_RENDER" "$FAT/config.txt" "$_dsi_overlay" "$_dsi_touch" \
+        || die "failed to render the DSI panel overlay into config.txt"
+else
+    log "WARN: $DSI_RENDER missing; config.txt has no DSI panel overlay injected"
+fi
+
 sed -e "s|@ROOT_PARTUUID@|$ROOT_PARTUUID|g" -e "s|@SLOT@|$SLOT|g" \
     "$RPI_BOOT_DIR/cmdline.txt.tmpl" > "$FAT/cmdline.txt"
 sync
