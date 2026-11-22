@@ -41,6 +41,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG="$SCRIPT_DIR/config"
+# Shared custom app code lives in the osmium-core submodule (core/), not at the
+# repo root any more. Every read of app code resolves against $CORE.
+CORE="$REPO_ROOT/core"
 VERSION="${IMAGE_VERSION:-}"
 OUT="${IMAGE_OUT:-$REPO_ROOT}"
 SUITE="${DEBIAN_SUITE:-trixie}"
@@ -240,11 +243,11 @@ mkdir -p "$BIN_DEST"
 # hifi_*.py set via glob — exactly what the x86 includes.chroot carries — keeps
 # this robust against new modules instead of a hand-maintained list that drifts.
 for py in api_server.py vu_meter_daemon.py sources_server.py webui_server.py; do
-    [ -f "$REPO_ROOT/$py" ] || { log "  (skip $py — not in repo root)"; continue; }
-    cp -f "$REPO_ROOT/$py" "$BIN_DEST/$py"
+    [ -f "$CORE/$py" ] || { log "  (skip $py — not in core/)"; continue; }
+    cp -f "$CORE/$py" "$BIN_DEST/$py"
     sed -i 's/\r$//' "$BIN_DEST/$py"
 done
-for py in "$REPO_ROOT"/hifi_*.py; do
+for py in "$CORE"/hifi_*.py; do
     [ -f "$py" ] || continue                       # no match → literal glob, skip
     cp -f "$py" "$BIN_DEST/"
     sed -i 's/\r$//' "$BIN_DEST/$(basename "$py")"
