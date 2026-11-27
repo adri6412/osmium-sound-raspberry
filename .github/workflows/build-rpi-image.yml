@@ -437,6 +437,66 @@ jobs:
             -T "manifest-out/latest-$CH.json" "$W/ota-rpi/latest-$CH.json"
           echo "mirrored osmium-rpi-$TAG.raucb and latest-$CH.json to Oracle Object Storage (ota-rpi/)"
 
+      # Serve the very same channel manifest from Cloudflare Pages, at the path
+      # the Pi fleet reads (osmium-sound.pages.dev/ota-rpi/latest-<ch>.json,
+      # platform.conf: HIFI_OTA_MANIFEST_BASE). The asset URLs inside it point at
+      # the Oracle READ PAR, so the .raucb still downloads from Oracle — Pages
+      # only hands out the small manifest. Reading it there is what lets the site
+      # count active Raspberry appliances (functions/_middleware.js), the way the
+      # x86 fleet is already counted, with no extra request and nothing personal
+      # stored. The staged folder holds only the channel manifest, so keep_files
+      # leaves the other channels on gh-pages untouched. Runs only when the
+      # Oracle mirror above actually produced the manifest.
+      - name: Stage the Raspberry manifest for Cloudflare Pages
+        id: stage-pages
+        if: ${{ needs.setup.outputs.publish == 'true' && needs.setup.outputs.sign == 'true' }}
+        env:
+          CH: ${{ steps.channel.outputs.channel }}
+        run: |
+          set -euo pipefail
+          if [ -f "manifest-out/latest-$CH.json" ]; then
+            mkdir -p ghpages-rpi
+            cp "manifest-out/latest-$CH.json" "ghpages-rpi/latest-$CH.json"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no manifest-out/latest-$CH.json (Oracle mirror skipped) — not publishing the Pi manifest to Pages"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish the Raspberry manifest to gh-pages (ota-rpi/)
+        if: ${{ steps.stage-pages.outputs.publish == 'true' }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./ghpages-rpi
+          publish_branch: gh-pages
+          destination_dir: ota-rpi
+          keep_files: true
+          enable_jekyll: false
+          commit_message: "ota-rpi: manifest ${{ github.ref_name }} for Cloudflare Pages"
+
+      # Tell the site to redeploy now, so Pages serves the manifest just pushed
+      # (osmium-sound-site/.github/workflows/deploy.yml, repository_dispatch:
+      # ota-updated). Needs a PAT with access to the site repo (secret
+      # SITE_DISPATCH_PAT); skips cleanly if it is unset — the next site deploy
+      # picks the manifest up anyway, only later.
+      - name: Dispatch the site deploy
+        if: ${{ steps.stage-pages.outputs.publish == 'true' }}
+        env:
+          SITE_DISPATCH_PAT: ${{ secrets.SITE_DISPATCH_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SITE_DISPATCH_PAT:-}" ]; then
+            echo "::warning::SITE_DISPATCH_PAT not set — not dispatching the site deploy (it will pick up the manifest on its next run)"
+            exit 0
+          fi
+          curl --fail -sS -X POST \
+            -H "Authorization: Bearer $SITE_DISPATCH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/adri6412/osmium-sound-site/dispatches \
+            -d '{"event_type":"ota-updated"}'
+          echo "dispatched ota-updated to osmium-sound-site"
+
   # Once the release is on the Oracle mirror, drop the ota-rpi/<tag>/ folders no
   # channel manifest names any more, so only the current release of each channel
   # (prod/dev/alpha) is kept — the Raspberry twin of x86's prune-ota-r2 call.
